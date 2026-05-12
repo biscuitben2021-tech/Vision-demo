@@ -1,0 +1,360 @@
+"""
+Design tokens for the Vision OS demo.
+
+All colors in this module exist in BOTH RGB (for PIL) and BGR (for OpenCV).
+Use the suffix that matches the library you are calling.  Mixing them
+silently produces washed-out blue tiles instead of warm whites -- a class
+of bug that is visually subtle and exhausting to track down later.
+
+    PIL takes RGB.   OpenCV takes BGR.   Same hex, different 3-tuple.
+
+We pre-compute both forms so no module ever has to remember which way the
+byte order goes.  Pick the constant by suffix, never by guessing.
+
+Module color-space convention:
+    `_RGB` -> pass to PIL (`PIL.ImageDraw.Draw.text`, etc.)
+    `_BGR` -> pass to OpenCV (`cv2.rectangle`, `cv2.circle`, etc.)
+
+Reading order:  palette  ->  spacing  ->  motion  ->  typography  ->  helpers.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Final
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+# ============================================================================
+# Palette
+# ============================================================================
+#
+# Each color is stored as (R, G, B) and (B, G, R) -- a tuple of three uint8
+# values, in 0..255.  The hex code in each comment is the canonical Apple
+# source value; the rationale below it is the WHY.  These values come
+# straight from apple_SKILL.md and were chosen by Apple, not by us.
+# Resist the urge to "tweak" them.
+
+
+# ----------------------------------------------------------------------------
+# Page surfaces
+# ----------------------------------------------------------------------------
+
+# #fbfbfd -- Apple's restraint: never pure white.  Pure #ffffff reads as a
+# fluorescent bulb and crushes the highlights on rounded glass tiles --
+# every surface ends up looking overexposed and the page feels cheap.
+# This warm near-white sits as paper.  If a render starts to look wrong
+# and you cannot tell why, check this first: someone almost certainly
+# replaced BG_LIGHT with (255, 255, 255).
+BG_LIGHT_RGB:   Final[tuple[int, int, int]] = (251, 251, 253)
+BG_LIGHT_BGR:   Final[tuple[int, int, int]] = (253, 251, 251)
+
+# #000000 -- The one place we use pure black, and only for tile rows that
+# alternate against BG_LIGHT.  Apple's marketing site is composed in
+# roughly half-and-half light/dark tile rows; the contrast IS the layout.
+BG_DARK_RGB:    Final[tuple[int, int, int]] = (0, 0, 0)
+BG_DARK_BGR:    Final[tuple[int, int, int]] = (0, 0, 0)
+
+# #f5f5f7 -- Secondary surface for footers, secondary tiles, search inputs.
+# One small step darker than BG_LIGHT.  Notice this is the same value as
+# TEXT_ON_DARK below -- that is intentional: Apple reuses the same warm
+# neutral on both ends of the contrast scale.
+BG_NEUTRAL_RGB: Final[tuple[int, int, int]] = (245, 245, 247)
+BG_NEUTRAL_BGR: Final[tuple[int, int, int]] = (247, 245, 245)
+
+
+# ----------------------------------------------------------------------------
+# Text colors
+# ----------------------------------------------------------------------------
+
+# #1d1d1f -- "Pure black on near-black would be invisible; pure black on
+# near-white is too aggressive."  This near-black has just enough warmth
+# to avoid the printing-on-receipt-paper effect.  Use for every primary
+# headline that sits on a light background.
+TEXT_ON_LIGHT_RGB:   Final[tuple[int, int, int]] = (29, 29, 31)
+TEXT_ON_LIGHT_BGR:   Final[tuple[int, int, int]] = (31, 29, 29)
+
+# #f5f5f7 -- Same numeric value as BG_NEUTRAL.  On a pure-black tile, pure
+# #ffffff text is searing; this warm neutral is the perceptual inverse of
+# TEXT_ON_LIGHT.  The repeated value is deliberate.
+TEXT_ON_DARK_RGB:    Final[tuple[int, int, int]] = (245, 245, 247)
+TEXT_ON_DARK_BGR:    Final[tuple[int, int, int]] = (247, 245, 245)
+
+# #86868b -- Muted body / subhead color.  Lighter than TEXT_ON_LIGHT by
+# enough that subheads recede behind headlines without disappearing.  This
+# is the canonical "muted gray" you see under every H2 on apple.com.
+TEXT_MUTED_RGB:      Final[tuple[int, int, int]] = (134, 134, 139)
+TEXT_MUTED_BGR:      Final[tuple[int, int, int]] = (139, 134, 134)
+
+# #6e6e73 -- Tertiary: disclaimers, footnotes, the FPS counter, anything
+# that should be legible but ignorable.  Sits one step darker than muted
+# -- it can stand alone in a quiet corner without competing for the eye.
+TEXT_TERTIARY_RGB:   Final[tuple[int, int, int]] = (110, 110, 115)
+TEXT_TERTIARY_BGR:   Final[tuple[int, int, int]] = (115, 110, 110)
+
+
+# ----------------------------------------------------------------------------
+# Accents (the "Learn more >" link blue)
+# ----------------------------------------------------------------------------
+
+# #0066cc -- The literal "Learn more >" link blue on light backgrounds.
+# Reserved for CTAs and inline links; never for body text.
+ACCENT_LIGHT_RGB: Final[tuple[int, int, int]] = (0, 102, 204)
+ACCENT_LIGHT_BGR: Final[tuple[int, int, int]] = (204, 102, 0)
+
+# #2997ff -- Same link, brighter so it has the contrast to read on a
+# pure-black tile.  Do not use this color on a light background; it's
+# tuned for #000.
+ACCENT_DARK_RGB:  Final[tuple[int, int, int]] = (41, 151, 255)
+ACCENT_DARK_BGR:  Final[tuple[int, int, int]] = (255, 151, 41)
+
+# #0077ed -- Hover state for ACCENT_LIGHT.  Subtle shift -- if it's too
+# bright the link "pops" out of the layout, which is the opposite of
+# Apple.  A 17-point hue nudge is the entire animation budget.
+ACCENT_HOVER_RGB: Final[tuple[int, int, int]] = (0, 119, 237)
+ACCENT_HOVER_BGR: Final[tuple[int, int, int]] = (237, 119, 0)
+
+
+# ----------------------------------------------------------------------------
+# Hairlines / dividers
+# ----------------------------------------------------------------------------
+
+# #d2d2d7 -- Only ever used in the footer dividers and form input borders.
+# If you reach for this on a tile, stop -- tile separation comes from the
+# 16px GAP_TILE alone, not from a stroke.  No borders on tiles, ever.
+HAIRLINE_RGB: Final[tuple[int, int, int]] = (210, 210, 215)
+HAIRLINE_BGR: Final[tuple[int, int, int]] = (215, 210, 210)
+
+
+# ============================================================================
+# Spacing tokens (pixels, desktop scale)
+# ============================================================================
+#
+# The whole layout breathes off these values.  Resist the urge to fudge
+# them by +/-2px per tile.  The 16px tile gap and the 24px tile radius
+# are the load-bearing values -- they're what makes the grid read as
+# "Apple" without any chrome.  Borders, drop shadows, dividers: all
+# absent.  Visual separation = gap + radius.
+
+GAP_TILE:          Final[int] = 16    # gap between adjacent tiles
+GAP_VIEWPORT:      Final[int] = 16    # gutter from tile group to viewport edge
+PAD_TILE_TOP:      Final[int] = 80    # top padding inside a tile
+PAD_TILE_X:        Final[int] = 40    # horizontal padding inside a tile
+RADIUS_TILE_LARGE: Final[int] = 24    # corner radius for big tiles
+RADIUS_TILE_SMALL: Final[int] = 18    # corner radius for small/mobile tiles
+RADIUS_APP_ICON:   Final[int] = 28    # corner radius for Vision OS app icons
+MAX_CONTENT_WIDTH: Final[int] = 980   # inner content column max width
+CTA_GAP:           Final[int] = 24    # gap between "Learn more >  Buy >"
+NAV_HEIGHT:        Final[int] = 44    # the blurred top nav bar
+
+
+# ============================================================================
+# Motion tokens (milliseconds + cubic bezier control points)
+# ============================================================================
+#
+# Wired up in src/motion.py during Phase 5.  Listed here as constants so
+# every phase imports motion timing from the same authoritative place --
+# no module gets to invent its own 250ms.
+
+FADE_UP_DURATION_MS:     Final[int] = 800
+# Apple's "ease-emphasized" curve: slow start, fast middle, gentle stop.
+# Pulled straight from apple_SKILL.md.  Implemented in motion.ease().
+FADE_UP_EASING:          Final[tuple[float, float, float, float]] = (
+    0.28, 0.11, 0.32, 1.0,
+)
+HOVER_SCALE_DURATION_MS: Final[int] = 200
+CTA_COLOR_DURATION_MS:   Final[int] = 200
+NAV_BLUR_DURATION_MS:    Final[int] = 250
+
+
+# ============================================================================
+# Typography -- font discovery + sized font loading
+# ============================================================================
+#
+# On modern macOS (Big Sur and later) SF Pro is shipped as a single
+# variable font at /System/Library/Fonts/SFNS.ttf -- one file with
+# weight, width, and optical-size axes baked in.  Older Apple docs
+# reference per-weight `.otf` files like `SF-Pro-Display-Semibold.otf`;
+# those do not exist on a fresh install of macOS Sequoia or later.
+#
+# PIL >= 9.5 supports variable fonts via `font.set_variation_by_name(...)`,
+# which is how we pick "Semibold" or "Regular" at load time.  The
+# optical-size axis is keyed to the font size we ask for: at >= 20px the
+# variable font auto-swaps to Display glyph shapes; below that, Text
+# shapes.  So we never specify Display vs Text directly -- the role-based
+# load_font helper just chooses a weight and lets the size do the rest.
+#
+# Helvetica Neue is the universal fallback.  It ships in HelveticaNeue.ttc
+# (a TrueType Collection of weights at known indices) on every Mac going
+# back a decade.  When SFNS is not readable, we hop to that.
+#
+# We deliberately do NOT use PIL's bundled default bitmap font as a final
+# fallback.  It's pixel-fitted and ruins the entire aesthetic; a missing
+# system font should fail loudly, not silently render an ugly demo.
+
+_SFNS_PATH:           Final[Path] = Path("/System/Library/Fonts/SFNS.ttf")
+_HELVETICA_NEUE_PATH: Final[Path] = Path("/System/Library/Fonts/HelveticaNeue.ttc")
+
+# Helvetica Neue collection face indices.  These have been stable across
+# every macOS release since Big Sur; do not re-derive them at runtime.
+_HELVETICA_NEUE_REGULAR_INDEX: Final[int] = 0
+_HELVETICA_NEUE_BOLD_INDEX:    Final[int] = 2
+
+# Named instances we ask SFNS to switch to.  Variable fonts expose a list
+# of named weight presets ("Regular", "Medium", "Semibold", "Bold", ...);
+# Phase 1 only ever asks for these two.  Later phases may need more.
+_SFNS_SEMIBOLD: Final[str] = "Semibold"
+_SFNS_REGULAR:  Final[str] = "Regular"
+
+
+def load_font(role: str, size: int) -> ImageFont.FreeTypeFont:
+    """Return a PIL TrueType font for the given role and size.
+
+    role:
+        "display" -> SF Pro Display Semibold.  Used for H1 / H2 / app titles.
+        "text"    -> SF Pro Text Regular.       Used for body, subheads,
+                                                FPS counter, footnotes.
+
+    size:  pixel height to render at.
+
+    SF Pro's variable font automatically swaps the optical-size variant
+    (Display vs Text glyph shapes) based on size, so we don't pass that
+    axis ourselves -- larger sizes get Display shapes, smaller sizes get
+    Text shapes.  We only pin the weight.
+
+    Raises:
+        ValueError        -- unknown role.
+        FileNotFoundError -- neither SFNS nor Helvetica Neue is installed.
+    """
+    if role not in ("display", "text"):
+        raise ValueError(
+            f"Unknown font role {role!r}; expected 'display' or 'text'."
+        )
+
+    # Preferred: SF Pro variable font.
+    if _SFNS_PATH.is_file():
+        font = ImageFont.truetype(str(_SFNS_PATH), size=size)
+        variation = _SFNS_SEMIBOLD if role == "display" else _SFNS_REGULAR
+        # set_variation_by_name is a no-op on PIL < 9.5 and raises OSError
+        # if the variation name doesn't exist in this exact .ttf release.
+        # Either way the font still works -- it just renders at the
+        # default weight (Regular), which is a graceful degradation.
+        try:
+            font.set_variation_by_name(variation)
+        except (OSError, AttributeError):
+            pass
+        return font
+
+    # Fallback: Helvetica Neue collection.
+    if _HELVETICA_NEUE_PATH.is_file():
+        index = (
+            _HELVETICA_NEUE_BOLD_INDEX
+            if role == "display"
+            else _HELVETICA_NEUE_REGULAR_INDEX
+        )
+        return ImageFont.truetype(
+            str(_HELVETICA_NEUE_PATH), size=size, index=index
+        )
+
+    raise FileNotFoundError(
+        f"Neither {_SFNS_PATH} nor {_HELVETICA_NEUE_PATH} could be found. "
+        "This demo expects SF Pro or Helvetica Neue installed in their "
+        "default macOS locations."
+    )
+
+
+# ============================================================================
+# Text drawing helper -- the PIL/cv2 boundary lives here
+# ============================================================================
+#
+# OpenCV ships a built-in font (`cv2.putText`) but it is a 1980s blitter
+# face: no antialiasing worth the name, no kerning, no subpixel placement.
+# Apple-grade typography at the sizes we need (12px footnotes, 80px
+# headlines) is simply not possible with it.
+#
+# So every piece of text in this demo is rendered via PIL onto a small
+# RGBA bitmap, then alpha-composited into the cv2 frame.  The conversion
+# is local to a tight bounding box around the glyphs -- pasting a 80x16
+# pixel patch is essentially free, where converting the whole 2560x1664
+# frame to PIL and back would dominate the per-frame budget.
+#
+# This function is the ONLY place where the PIL/cv2 byte-order dance is
+# allowed to live.  Everywhere else in the codebase, the suffix-typed
+# constants from this module are passed straight to whichever library
+# needs them.
+
+def draw_text(
+    frame: np.ndarray,
+    text: str,
+    x: int,
+    y: int,
+    color_rgb: tuple[int, int, int],
+    font: ImageFont.FreeTypeFont,
+) -> None:
+    """Composite `text` onto a BGR cv2 `frame` at (x, y), mutating it in place.
+
+    The text is rendered into a transparent PIL image sized to the glyph
+    bounding box, then alpha-blended into the frame.  Using a tightly
+    cropped patch (rather than wrapping the whole frame in PIL) keeps
+    the per-frame cost flat regardless of frame resolution.
+
+    Arguments:
+        frame:     BGR uint8 image, shape (H, W, 3).  Mutated in place.
+        text:      string to render.  Empty / whitespace-only strings are
+                   a no-op.
+        x, y:      top-left of the text's bounding box, in frame pixels.
+                   Off-frame coordinates are clipped.
+        color_rgb: (R, G, B) tuple in 0..255.  Note RGB, not BGR -- PIL
+                   draws it.  The conversion to BGR happens inside.
+        font:      a PIL ImageFont.FreeTypeFont as returned by load_font.
+    """
+    if not text:
+        return
+
+    # Measure the glyphs.  getbbox returns (left, top, right, bottom) in
+    # font space.  For some fonts `left` is negative (left side-bearing of
+    # the first glyph extends past x=0); we offset the actual draw call by
+    # -left so the glyph pulls back into the canvas.
+    left, top, right, bottom = font.getbbox(text)
+    width  = right - left
+    height = bottom - top
+    if width <= 0 or height <= 0:
+        return
+
+    # Render onto a transparent RGBA patch.  Alpha 0 background means only
+    # the glyph itself contributes to the composite.
+    patch = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ImageDraw.Draw(patch).text(
+        (-left, -top), text, fill=color_rgb + (255,), font=font,
+    )
+
+    # PIL -> numpy.  Result is (H, W, 4) in RGBA order; we split alpha
+    # out and reverse the colour channels to land in BGR for the frame.
+    rgba = np.array(patch)
+    bgr  = rgba[..., 2::-1]                              # R,G,B -> B,G,R
+    alpha = rgba[..., 3:4].astype(np.float32) * (1.0 / 255.0)
+
+    # Clip the destination rectangle to the frame.  Off-screen text is a
+    # silent no-op rather than an exception -- callers regularly compute
+    # positions that may overflow during transitions.
+    frame_h, frame_w = frame.shape[:2]
+    x0 = max(0, x)
+    y0 = max(0, y)
+    x1 = min(frame_w, x + width)
+    y1 = min(frame_h, y + height)
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    # Map the clipped destination rect back into source coordinates.
+    sx0 = x0 - x
+    sy0 = y0 - y
+    sx1 = sx0 + (x1 - x0)
+    sy1 = sy0 + (y1 - y0)
+
+    dst = frame[y0:y1, x0:x1].astype(np.float32)
+    src = bgr[sy0:sy1, sx0:sx1].astype(np.float32)
+    a   = alpha[sy0:sy1, sx0:sx1]
+
+    # Standard "over" compositing: out = src*a + dst*(1-a).  In place.
+    frame[y0:y1, x0:x1] = (a * src + (1.0 - a) * dst).astype(np.uint8)

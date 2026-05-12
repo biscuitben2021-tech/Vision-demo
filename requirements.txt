@@ -1,0 +1,21 @@
+# Phase 1 dependencies for the Vision OS demo.
+#
+# Why these versions:
+#   opencv-python >= 4.10   -- needed for cv2.getWindowImageRect on macOS
+#                              and for the WND_PROP_FULLSCREEN flag to
+#                              actually take effect when paired with
+#                              WINDOW_NORMAL.  Older 4.5.x wheels are
+#                              buggy on Apple Silicon.
+#   numpy        >= 1.26    -- last numpy 1.x with arm64 wheels; numpy 2.x
+#                              also fine but cv2 wheels need to be matched.
+#   Pillow       >= 10.0    -- font.set_variation_by_name landed in 9.5;
+#                              10+ gives us the modern getbbox/getlength
+#                              text-metrics API we rely on for layout.
+#
+# We deliberately do NOT add MediaPipe, scikit-learn, or any tracker
+# library here.  Part 1 (the OS) renders with cv2 + numpy + PIL only.
+# Trackers come in Phase 8+ when we clone this folder.
+
+opencv-python>=4.10,<5
+numpy>=1.26,<3
+Pillow>=10.0,<12
