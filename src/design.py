@@ -284,6 +284,47 @@ def load_font(role: str, size: int) -> ImageFont.FreeTypeFont:
 # constants from this module are passed straight to whichever library
 # needs them.
 
+def _align_x_offset(
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    align: str,
+) -> int:
+    """Return the integer pixel offset to subtract from the caller's `x`.
+
+    Why a separate helper:  alignment is conceptually a horizontal anchor
+    decision -- "is the given x the left, center, or right of this run?"
+    -- and it has nothing to do with the rasterise/composite pipeline that
+    `draw_text` does after it.  Splitting it out keeps `draw_text` under
+    30 lines and lets callers reason about anchor math without scrolling
+    through alpha blending code.
+
+    We use `font.getlength(text)` rather than `font.getbbox(text)` because
+    getlength returns the typographic advance width -- exactly what you
+    want for horizontal anchoring (it is what a text shaper would place
+    the next character at).  getbbox over-includes side bearings, which
+    causes center- and right-aligned headings to drift a couple of pixels
+    relative to the visible glyph extents.  This is exactly the same
+    reason `render_fps` in phase1_canvas.py uses getlength.
+
+    Anchor semantics:
+        "left"   ->  x is the left edge of the glyph run; offset = 0.
+        "center" ->  x is the horizontal midpoint;      offset = advance / 2.
+        "right"  ->  x is the right edge of the glyph run; offset = advance.
+    """
+    if align == "left":
+        # Fast path; preserves the pre-existing API exactly so every
+        # caller written against the old signature renders identically.
+        return 0
+    advance = int(round(font.getlength(text)))
+    if align == "center":
+        return advance // 2
+    if align == "right":
+        return advance
+    raise ValueError(
+        f"Unknown align {align!r}; expected 'left', 'center', or 'right'."
+    )
+
+
 def draw_text(
     frame: np.ndarray,
     text: str,
@@ -291,8 +332,9 @@ def draw_text(
     y: int,
     color_rgb: tuple[int, int, int],
     font: ImageFont.FreeTypeFont,
+    align: str = "left",
 ) -> None:
-    """Composite `text` onto a BGR cv2 `frame` at (x, y), mutating it in place.
+    """Composite `text` onto a BGR cv2 `frame`, mutating it in place.
 
     The text is rendered into a transparent PIL image sized to the glyph
     bounding box, then alpha-blended into the frame.  Using a tightly
@@ -303,14 +345,30 @@ def draw_text(
         frame:     BGR uint8 image, shape (H, W, 3).  Mutated in place.
         text:      string to render.  Empty / whitespace-only strings are
                    a no-op.
-        x, y:      top-left of the text's bounding box, in frame pixels.
-                   Off-frame coordinates are clipped.
+        x, y:      anchor of the text's bounding box, in frame pixels.
+                   The role of `x` depends on `align` (see below); `y` is
+                   always the top of the bounding box.  Off-frame
+                   coordinates are clipped.
         color_rgb: (R, G, B) tuple in 0..255.  Note RGB, not BGR -- PIL
-                   draws it.  The conversion to BGR happens inside.
+                   draws it.  The conversion to BGR happens inside, in the
+                   `rgba[..., 2::-1]` slice that reverses channel order
+                   without copying the array.
         font:      a PIL ImageFont.FreeTypeFont as returned by load_font.
+        align:     "left" (default), "center", or "right".  Selects which
+                   horizontal point of the rendered text sits at `x`.
+                   Centering math is done here, not at the call site --
+                   that way every screen ("center the H1", "center the
+                   subhead", "right-align the FPS") uses the same anchor
+                   semantics instead of each caller re-deriving them.
     """
     if not text:
         return
+
+    # Apply the alignment anchor BEFORE the existing pipeline runs.  This
+    # is the entire point of the split: from here on, the function does
+    # exactly what it did before align was added, so align="left" is a
+    # bit-for-bit no-op relative to the previous behaviour.
+    x = x - _align_x_offset(text, font, align)
 
     # Measure the glyphs.  getbbox returns (left, top, right, bottom) in
     # font space.  For some fonts `left` is negative (left side-bearing of
