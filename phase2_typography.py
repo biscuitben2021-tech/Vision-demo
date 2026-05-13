@@ -53,20 +53,18 @@ from src.design import (
     CTA_GAP,
     TEXT_MUTED_RGB,
     TEXT_ON_LIGHT_RGB,
-    TEXT_TERTIARY_RGB,
+    draw_fps_hud,
     draw_text,
     load_font,
 )
 from phase1_canvas import (
     FPS_EMA_ALPHA,
-    FPS_FONT_SIZE,
     QUIT_KEY_ESC,
     QUIT_KEY_Q_L,
     QUIT_KEY_Q_U,
     WINDOW_NAME,
     make_canvas,
     make_fullscreen_window,
-    render_fps,
     screen_size,
 )
 
@@ -244,12 +242,11 @@ def main() -> None:
     # Load every font ONCE up front.  PIL truetype loads are not free
     # (the OS opens the file, parses the table directory, etc.), and
     # doing it once per frame would show up as a noticeable FPS drop
-    # at 60Hz.  Phase 1 already does this for fps_font; we extend the
-    # pattern here.
+    # at 60Hz.  The FPS HUD's font is now owned by `draw_fps_hud` (it
+    # caches its own font internally), so this list shrinks by one.
     h1_font      = load_font(role="display", size=H1_SIZE)
     subhead_font = load_font(role="text",    size=SUBHEAD_SIZE)
     cta_font     = load_font(role="text",    size=CTA_SIZE)
-    fps_font     = load_font(role="text",    size=FPS_FONT_SIZE)
 
     width, height = screen_size(WINDOW_NAME)
     canvas = make_canvas(width, height)
@@ -288,8 +285,10 @@ def main() -> None:
             )
 
         # Hero block (H1, subhead, CTA row) plus the top-right FPS counter.
+        # draw_fps_hud is the last paint so the counter never gets occluded
+        # by a status bar or notification.
         compose_hero(canvas, width, height, h1_font, subhead_font, cta_font)
-        render_fps(canvas, f"{fps_ema:5.1f} fps", fps_font, width)
+        draw_fps_hud(canvas, fps_ema)
 
         cv2.imshow(WINDOW_NAME, canvas)
 

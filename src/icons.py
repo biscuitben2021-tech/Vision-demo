@@ -102,86 +102,167 @@ from src.tiles import rounded_rect
 #     original frame pixels exactly as they were.  This generalises to
 #     any wallpaper without modification.
 
-# Pixel-wise additive brighten applied to the background slice before the
-# tint mix.  Range chosen empirically: 25 reads as "barely brightened",
-# 35 starts to clip on already-bright wallpapers.  30 is the sweet spot
-# on a #000 page and degrades gracefully on lighter pages.
-_GLASS_BRIGHTEN: Final[int] = 30
+# ============================================================================
+# Liquid Glass constants (WWDC 2025 design language)
+# ============================================================================
+#
+# Liquid Glass replaces the earlier flat tinted-rect treatment with six
+# layered visual components.  None of them alone sells the effect; all
+# six together produce a panel that reads as a physical translucent
+# surface rather than a darker rectangle painted on the wallpaper.  See
+# the long WHY block at each helper below.
 
-# Lerp factor toward each pixel's luminance scalar.  0.0 = no
-# desaturation (pixels untouched), 1.0 = fully grayscale.  visionOS
-# glass is *slightly* desaturated -- enough to feel cool but not so
-# much that a colourful wallpaper goes monochrome.  0.15 is the Apple
-# default for tinted glass per their HIG.
-_GLASS_DESATURATE: Final[float] = 0.15
+# Frost tint -- near-white BGR plane that gets alpha-blended onto the
+# glass surface at 10-12% opacity.  This is the single most important
+# component: without it, the panel looks like "tinted glass over content"
+# rather than "frosted glass with content underneath".  (240, 240, 245)
+# BGR has a hair of blue lift in BGR -- a faint cool cast that
+# distinguishes it from pure paper white.
+_FROST_TINT_BGR: Final[tuple[int, int, int]] = (240, 240, 245)
 
-# Near-black tint mixed in at 0.15 weight.  (10, 10, 14) BGR is a hair
-# of blue bias -- gives the glass a cold, mineralic cast.  Pure black
-# (0, 0, 0) produces a "dirty grey" look that reads as cheap.  These
-# values are not knobs; they were chosen alongside the 0.85 / 0.15 mix.
-_GLASS_TINT_BGR: Final[tuple[int, int, int]] = (10, 10, 14)
+# Rim highlight colour.  Slightly cooler than pure #fff so the rim
+# doesn't read as a "fluorescent strip" against the warm content
+# behind it.  Drawn at 1px with cv2.LINE_AA along the top edge + top
+# corner arcs, then composited at 50% opacity.
+_RIM_COLOR_BGR: Final[tuple[int, int, int]] = (245, 245, 250)
 
-# Mix weights for the addWeighted call.  See the long block above for
-# the WHY behind 0.85 / 0.15.
-_GLASS_SURFACE_WEIGHT: Final[float] = 0.85
-_GLASS_TINT_WEIGHT:    Final[float] = 0.15
+# Blur kernel range.  Even values must be incremented to odd because
+# cv2.GaussianBlur requires an odd kernel size.  Intensity 1.0 picks
+# 31, intensity 0.0 picks 21; lower intensity for app icons / cards
+# where the source region is small and a smaller kernel is plenty.
+_BLUR_KSIZE_MAX: Final[int] = 31
+_BLUR_KSIZE_MIN: Final[int] = 21
 
-# BT.601 luminance coefficients (B, G, R order to match the cv2 BGR
-# channel layout).  Using BT.709 instead would shift the desaturated
-# tone slightly cool, which we don't want -- glass should feel neutral
-# rather than blue.  These are universal video coefficients.
-_LUMINANCE_BGR: Final[tuple[float, float, float]] = (0.114, 0.587, 0.299)
+# Skip-blur threshold.  When the region under the panel has
+# region.std() < this, the underlying content is essentially uniform
+# (typically BG_DARK on the home screen) and blurring it would do
+# nothing visible -- the saved ~5-10ms of GaussianBlur time goes
+# straight into the per-frame headroom.  The rest of the components
+# still sell the glass effect on their own.
+_BLUR_SKIP_STD: Final[float] = 5.0
+
+# Brightness lift (HSV V channel).  Real glass passes most light
+# through but picks up energy.  We add to V (lightness) in HSV so the
+# hue / saturation don't shift -- adding to all three BGR channels
+# would chase highlights toward white.  Range 12..18 by intensity.
+_V_LIFT_BASE:  Final[int] = 12
+_V_LIFT_RANGE: Final[int] = 6
+
+# Frost tint alpha range.  10% on a small icon tile reads as a
+# polish; 12% on the status bar reads as glass.  Scaled by intensity.
+_FROST_ALPHA_BASE:  Final[float] = 0.10
+_FROST_ALPHA_RANGE: Final[float] = 0.02
+
+# Top inner gradient.  Vertical alpha ramp from 0.06 at the top edge
+# fading to 0.0 at TOP_GRADIENT_DEPTH rows.  Blends toward pure white
+# to add light, not toward grey (which would dirty the panel).
+_TOP_GRADIENT_DEPTH: Final[int] = 12
+_TOP_GRADIENT_ALPHA: Final[float] = 0.06
+
+# Bottom inner shadow.  Vertical alpha ramp from 0.0 to 0.15 over
+# BOTTOM_SHADOW_DEPTH rows at the bottom edge.  Blends toward black
+# to deepen the bottom and sell the "floating physical surface" look.
+_BOTTOM_SHADOW_DEPTH: Final[int] = 3
+_BOTTOM_SHADOW_ALPHA: Final[float] = 0.15
+
+# Rim opacity (alpha used when blending the rim copy back into the
+# surface).  50% reads as a soft white edge; 100% would look like a
+# hard CAD stroke.
+_RIM_ALPHA: Final[float] = 0.5
 
 
-def _build_glass_surface(under: np.ndarray) -> np.ndarray:
-    """Return a brightened-and-desaturated copy of `under`, tinted toward dark.
+# Module-level rounded-rect mask cache.  Keys are (w, h, radius).
+# Rounded-rect masks are pure geometry -- same inputs always produce
+# the same array -- so they're a textbook memoise target.  Generating
+# one via rounded_rect costs ~5ms per call on a 240x64 panel; with 9
+# panels per frame (status bar + 8 app icons) that's 45ms saved per
+# steady-state frame after the first.  Module-level dict (rather than
+# a function attribute) so the cache survives across the few callers
+# in the codebase without per-call setup.
+_MASK_CACHE: dict[tuple[int, int, int], np.ndarray] = {}
 
-    The math, applied per-pixel:
 
-        bright = clamp(under + _GLASS_BRIGHTEN, 0, 255)
-        lum    = bright . _LUMINANCE_BGR             # scalar per pixel
-        desat  = lerp(bright, lum, _GLASS_DESATURATE)
-        tint   = fill(under.shape, _GLASS_TINT_BGR)
-        out    = (desat * 0.85) + (tint * 0.15)
+def _blur_kernel_size(intensity: float) -> int:
+    """Pick an odd Gaussian kernel size for the given intensity.
 
-    All steps run in float32 to avoid clipping at intermediate
-    saturation points; we cast back to uint8 only at the very end.  `under`
-    is read-only (we never mutate the caller's frame slice).
+    intensity = 1.0  ->  31  (strongest refraction; status bar)
+    intensity = 0.85 ->  29  (app icon tiles)
+    intensity = 0.9  ->  30 -> 31 (notifications; even => bumped to 31)
+    intensity = 0.0  ->  21  (minimum; preserves any blur but cheap)
+
+    Returns an odd int in the range [_BLUR_KSIZE_MIN, _BLUR_KSIZE_MAX].
+    cv2.GaussianBlur requires odd kernel sizes; we bump even values
+    upward rather than truncating downward so the higher-intensity
+    setting always picks the stronger blur.
     """
-    # uint8 -> float32 once, then everything downstream stays float.  cv2
-    # would happily do uint8 saturation arithmetic but a float pipeline
-    # lets us do the luminance lerp without rounding artefacts.
-    bright = under.astype(np.float32) + float(_GLASS_BRIGHTEN)
-    np.clip(bright, 0.0, 255.0, out=bright)
+    raw = _BLUR_KSIZE_MIN + intensity * (_BLUR_KSIZE_MAX - _BLUR_KSIZE_MIN)
+    ksize = int(round(raw))
+    if ksize % 2 == 0:
+        ksize += 1
+    return max(_BLUR_KSIZE_MIN, min(_BLUR_KSIZE_MAX, ksize))
 
-    # Per-pixel luminance as a (H, W, 1) scalar broadcast back over the
-    # three channels.  This is a tight dot product across the channel
-    # axis, computed once for the whole slice in one pass.
-    lum = (
-        bright[..., 0] * _LUMINANCE_BGR[0]
-        + bright[..., 1] * _LUMINANCE_BGR[1]
-        + bright[..., 2] * _LUMINANCE_BGR[2]
-    )[..., np.newaxis]
 
-    # lerp(bright, lum, t):  t=0 keeps colour, t=1 goes greyscale.  At
-    # 0.15 the colour reads as "slightly cooled" rather than "grey".
-    desat = bright + (lum - bright) * _GLASS_DESATURATE
+def _glass_base(region: np.ndarray, intensity: float) -> np.ndarray:
+    """Build the Liquid Glass base layer from `region`: blur, brighten, frost.
 
-    # Solid near-black plane the same shape as the patch.  Allocated
-    # once per call -- cheap relative to the surface composite below.
-    tint = np.empty_like(desat)
-    tint[:, :] = _GLASS_TINT_BGR
+    Three of the six visual components of Liquid Glass land in this
+    function.  The other three (top gradient, bottom shadow, rim
+    highlight) are layered onto the base by their respective helpers
+    AFTER the orchestrator has composited the base into the frame.
 
-    surface = cv2.addWeighted(
-        desat, _GLASS_SURFACE_WEIGHT,
-        tint,  _GLASS_TINT_WEIGHT,
-        0.0,
-    )
-    # Final clamp + cast.  cv2.addWeighted on float32 inputs returns
-    # float32; we narrow once at the boundary so callers get a normal
-    # BGR uint8 buffer they can splice straight back into the frame.
-    np.clip(surface, 0.0, 255.0, out=surface)
-    return surface.astype(np.uint8)
+    Colour-space convention: input and output are BGR uint8.  The HSV
+    conversion in the middle of the pipeline is transient -- the
+    function never returns an HSV buffer.  This matters because the
+    rest of the codebase assumes every numpy frame slice is BGR.
+
+    Args:
+        region:    BGR uint8 region under the panel.  Read-only; we
+                   return a fresh buffer rather than mutating it.
+        intensity: 0.0..1.0 scalar controlling the strength of each
+                   component.  1.0 = status bar.  0.85 = app icon
+                   backgrounds.  0.9 = notification cards.
+
+    Returns:
+        Fresh BGR uint8 array, same shape as `region`.
+    """
+    # 1. Refraction blur.  Gaussian blur simulates light scattering
+    #    through real glass -- "blur simulates refraction through real
+    #    glass".  Skip the blur entirely when the region is near-
+    #    uniform (region.std() < 5): on a BG_DARK home screen the
+    #    panel sits over pure black, blurring pure black is a pure
+    #    no-op, and the saved 5-10ms goes straight back to the FPS
+    #    budget.  The tint + rim + gradient + shadow still sell the
+    #    effect alone -- the blur matters only when there's varied
+    #    content underneath.
+    if float(region.std()) >= _BLUR_SKIP_STD:
+        ksize = _blur_kernel_size(intensity)
+        blurred = cv2.GaussianBlur(region, (ksize, ksize), 0)
+    else:
+        blurred = region.copy()
+
+    # 2. Brightness lift.  Real glass passes most light through but
+    #    picks up energy doing so -- the surface reads a touch brighter
+    #    than what's behind it.  We add a constant to the V channel of
+    #    HSV (lightness axis) rather than to each BGR channel because
+    #    V lifts perceived lightness without shifting hue or
+    #    saturation; B+G+R addition pushes highlights toward neutral
+    #    white and washes colour out of the underlying content.
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    v_lift = _V_LIFT_BASE + int(round(_V_LIFT_RANGE * intensity))
+    v = hsv[..., 2].astype(np.int16) + v_lift
+    hsv[..., 2] = np.clip(v, 0, 255).astype(np.uint8)
+    lifted = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    # 3. Frost tint.  The single most important glass component:
+    #    alpha-blending toward a near-white plane is what makes the
+    #    panel read as "glass surface" rather than "darker rectangle".
+    #    10-12% opacity is tuned so the underlying content stays
+    #    legible while the panel acquires a soft frosted look.  At
+    #    >15% the panel starts to look like opaque frosted plastic.
+    tint_alpha = _FROST_ALPHA_BASE + _FROST_ALPHA_RANGE * intensity
+    tint = np.empty_like(lifted)
+    tint[:] = _FROST_TINT_BGR
+    return cv2.addWeighted(lifted, 1.0 - tint_alpha, tint, tint_alpha, 0.0)
 
 
 def _build_rounded_mask(w: int, h: int, radius: int) -> np.ndarray:
@@ -235,6 +316,144 @@ def _apply_rounded_mask(
     return out.astype(np.uint8)
 
 
+def _get_rounded_mask(w: int, h: int, radius: int) -> np.ndarray:
+    """Return a cached rounded-rect alpha mask of shape (h, w), uint8.
+
+    Mask values are 255 inside the rounded rectangle, 0 outside, with
+    antialiased corner pixels.  The result depends only on (w, h,
+    radius) -- pure geometry -- so the array is safe to memoise and
+    share across frames.
+
+    Why caching matters: building a mask via `_build_rounded_mask`
+    costs ~5ms per call on a 240x64 panel.  With 9 glass panels per
+    frame (status bar + 8 app icons) that's ~45ms per steady-state
+    frame thrown away on rebuilding identical arrays.  This dict
+    lookup amortises that to a one-time cost after warmup.
+
+    The returned array is treated as read-only by every caller in
+    this module.  Slicing it is fine (numpy returns a view); none of
+    the downstream code writes back into the mask.
+    """
+    key = (w, h, radius)
+    cached = _MASK_CACHE.get(key)
+    if cached is None:
+        cached = _build_rounded_mask(w, h, radius)
+        _MASK_CACHE[key] = cached
+    return cached
+
+
+def _glass_top_gradient(surface: np.ndarray, mask: np.ndarray) -> None:
+    """Apply a soft top-edge inner gradient to `surface`, in place.
+
+    Visual purpose: glass picks up a brighter wash at its top edge
+    from the implied light source above.  Without this the panel
+    reads as a flat sticker; with it the panel reads as a thin
+    physical surface catching daylight.
+
+    Implementation: a vertical alpha ramp from 0.06 at the topmost
+    row fading to 0.0 at `_TOP_GRADIENT_DEPTH` rows, modulated by the
+    rounded mask's top strip so the gradient respects the panel's
+    actual silhouette (corner pixels with mask=0 contribute nothing).
+    Blends toward pure white -- the highlight should add LIGHT, not
+    shift hue.
+
+    Colour-space convention: `surface` is panel-local BGR uint8;
+    `mask` is panel-local single-channel uint8.  Both mutated only
+    via the slice indexing semantics of numpy (no in-place HSV or
+    channel-order surprises).
+    """
+    h, w = surface.shape[:2]
+    depth = min(_TOP_GRADIENT_DEPTH, h)
+    if depth <= 0:
+        return
+    # Alpha ramp shape (depth, 1, 1) broadcasts cleanly against the
+    # (depth, w, 3) surface slice.  np.linspace endpoints inclusive.
+    ramp = np.linspace(
+        _TOP_GRADIENT_ALPHA, 0.0, depth, dtype=np.float32,
+    )[:, None, None]
+    m = mask[:depth, :, None].astype(np.float32) * (1.0 / 255.0)
+    alpha = ramp * m
+    region = surface[:depth].astype(np.float32)
+    region = region * (1.0 - alpha) + 255.0 * alpha
+    np.clip(region, 0.0, 255.0, out=region)
+    surface[:depth] = region.astype(np.uint8)
+
+
+def _glass_bottom_shadow(surface: np.ndarray, mask: np.ndarray) -> None:
+    """Apply a faint bottom-edge inner shadow to `surface`, in place.
+
+    Visual purpose: gives the glass panel physical depth.  The
+    bottom edge sits in slight shadow because the implied light
+    source above doesn't reach it as strongly.  Without this the
+    panel reads as a flat sticker; with it the panel reads as a
+    thin floating physical surface.
+
+    Implementation: a vertical alpha ramp from 0.0 to 0.15 across
+    the last `_BOTTOM_SHADOW_DEPTH` rows, modulated by the rounded
+    mask's bottom strip.  Blends toward pure black to deepen the
+    edge rather than toward grey (which would dirty the panel).
+
+    Same panel-local BGR uint8 / single-channel uint8 conventions as
+    `_glass_top_gradient`.
+    """
+    h, w = surface.shape[:2]
+    depth = min(_BOTTOM_SHADOW_DEPTH, h)
+    if depth <= 0:
+        return
+    ramp = np.linspace(
+        0.0, _BOTTOM_SHADOW_ALPHA, depth, dtype=np.float32,
+    )[:, None, None]
+    m = mask[-depth:, :, None].astype(np.float32) * (1.0 / 255.0)
+    alpha = ramp * m
+    region = surface[-depth:].astype(np.float32)
+    # Blend toward black: out = region * (1 - alpha) + 0 * alpha.
+    region = region * (1.0 - alpha)
+    surface[-depth:] = region.astype(np.uint8)
+
+
+def _glass_rim(surface: np.ndarray, w: int, h: int, radius: int) -> None:
+    """Draw a 1px near-white rim along the top ~40% of the perimeter, in place.
+
+    Visual purpose: glass catches its edge in light from above.  The
+    rim follows: top straight edge between the two corner centres +
+    the top-left rounded corner arc + the top-right rounded corner
+    arc.  Drawn at 50% opacity so it reads as a soft white edge, not
+    a hard CAD stroke -- the trick is to paint the rim onto a copy at
+    full white and then `cv2.addWeighted` the copy back at 0.5.
+    Untouched pixels stay identical (0.5*p + 0.5*p == p); only the
+    rim-coloured pixels shift halfway toward white.
+
+    OpenCV ellipse angle convention: 0° points along +x, angles
+    increase clockwise in image (y-down) coordinates.  Top-left
+    corner arc therefore spans 180° (leftmost) through 270° (topmost);
+    top-right corner arc spans 270° (topmost) through 360°
+    (rightmost).
+
+    Coordinates are panel-local: (0, 0) is the top-left of `surface`.
+    `surface` is BGR uint8 and mutated in place.
+    """
+    if w < 2 * radius or h < 2:
+        return  # panel too small for a meaningful rim
+    rim = surface.copy()
+    color = _RIM_COLOR_BGR
+    # Top straight edge between the two corner centres.  cv2.line is
+    # subpixel-exact with LINE_AA; we don't need to inset by 0.5px.
+    cv2.line(
+        rim, (radius, 0), (w - radius, 0), color, 1, cv2.LINE_AA,
+    )
+    # Top-left corner arc: 180° -> 270°.
+    cv2.ellipse(
+        rim, (radius, radius), (radius, radius),
+        0.0, 180.0, 270.0, color, 1, cv2.LINE_AA,
+    )
+    # Top-right corner arc: 270° -> 360°.
+    cv2.ellipse(
+        rim, (w - radius, radius), (radius, radius),
+        0.0, 270.0, 360.0, color, 1, cv2.LINE_AA,
+    )
+    cv2.addWeighted(rim, _RIM_ALPHA, surface, 1.0 - _RIM_ALPHA, 0.0, dst=surface)
+
+
 def draw_glass_panel(
     frame: np.ndarray,
     x: int,
@@ -242,32 +461,54 @@ def draw_glass_panel(
     w: int,
     h: int,
     radius: int,
+    *,
+    intensity: float = 1.0,
 ) -> None:
-    """Composite a translucent glass surface over frame[y:y+h, x:x+w].
+    """Composite a Liquid Glass surface over frame[y:y+h, x:x+w].
 
-    Mutates `frame` in place; outside the rounded interior of the panel
-    the original pixels are preserved exactly.  This is the *only*
-    legitimate way to make a Vision OS tile -- a hand-rolled rect
-    overlay will not produce the lifted, cooled-down look.
+    The successor to the earlier flat tinted-rect treatment, this
+    builds all six Liquid Glass components in sequence:
 
-    Off-frame placements (x<0, x+w>frame_w, etc.) are silently clipped
-    to the visible region; nothing draws outside the canvas.
+        1. Refraction blur     -- skipped when the underlying region
+                                  is near-uniform (region.std() < 5).
+        2. Brightness lift     -- +12..+18 on the HSV V channel,
+                                  scaled by intensity.
+        3. Frost tint          -- 10-12% alpha blend toward near-white
+                                  (240, 240, 245) BGR.
+        4. Top inner gradient  -- 0.06 -> 0 over 12 rows, blended
+                                  toward white.
+        5. Bottom inner shadow -- 0.0 -> 0.15 over 3 rows, blended
+                                  toward black.
+        6. Top-edge rim        -- 1px near-white along the top edge +
+                                  top corner arcs at 50% opacity.
+
+    Mutates `frame` in place; outside the rounded interior of the
+    panel the original pixels are preserved exactly.
+
+    Off-frame placements (x < 0, x + w > frame_w, etc.) are silently
+    clipped to the visible region; nothing draws outside the canvas.
+    When clipping occurs the rim is skipped because its corner arcs
+    are only correct when the full panel rectangle is on-screen.
 
     Args:
-        frame:  BGR uint8 image, mutated in place.
-        x, y:   top-left of the panel's bounding rect, in frame pixels.
-        w, h:   panel width / height.  Must be positive; sub-2*radius
-                values are tolerated -- the rounded mask just degrades
-                to a smaller-radius shape (matching `rounded_rect`).
-        radius: corner radius in pixels.  Pass `RADIUS_APP_ICON` for
-                home-screen tiles or `RADIUS_TILE_LARGE` for full-size
-                marketing tiles.
+        frame:     BGR uint8 image, mutated in place.
+        x, y:      top-left of the panel's bounding rect, in frame
+                   pixels.
+        w, h:      panel width / height.
+        radius:    corner radius in pixels.
+        intensity: keyword-only.  Scales every visual component.
+                   1.0  = status bar (strongest blur, biggest V lift,
+                          biggest tint, full rim).
+                   0.85 = app icon backgrounds.
+                   0.9  = notification cards.
+                   Default 1.0 preserves backward compatibility with
+                   every existing caller written against the old
+                   signature.
     """
-    # Clip the placement to frame extents -- off-screen panels are a
-    # silent no-op rather than an exception, matching draw_text and
-    # rounded_rect's contracts.  Negative origin handling: shift the
-    # source patch by the same offset so the visible portion still
-    # composites correctly.
+    # Clip the placement to frame extents.  Off-screen panels are a
+    # silent no-op, matching `draw_text` and `rounded_rect`.  When
+    # the origin is negative we still produce the visible slice
+    # (consumes mask rows/cols from the appropriate offset).
     frame_h, frame_w = frame.shape[:2]
     x0 = max(0, x)
     y0 = max(0, y)
@@ -278,25 +519,39 @@ def draw_glass_panel(
     clip_w = x1 - x0
     clip_h = y1 - y0
 
-    # 1. Slice the area under the panel and 2-3. build the brightened,
-    #    desaturated, tinted surface.  _build_glass_surface returns a
-    #    fresh buffer; we are NOT yet writing back into the frame.
-    under   = frame[y0:y1, x0:x1]
-    surface = _build_glass_surface(under)
+    # Mask is cached over the FULL (w, h, radius) shape; we slice
+    # whichever portion of it survived the clipping.  Reusing the
+    # full-size cache key means a status bar that occasionally drifts
+    # off-canvas still hits the cache for its on-screen frames.
+    full_mask = _get_rounded_mask(w, h, radius)
+    mask = full_mask[
+        (y0 - y):(y0 - y + clip_h),
+        (x0 - x):(x0 - x + clip_w),
+    ]
 
-    # 4-5. Build the rounded alpha mask the same size as the clipped
-    #      surface, then alpha-composite over the original frame slice.
-    #      The mask handles the radius for us; we never paint corner
-    #      pixels explicitly.
-    mask        = _build_rounded_mask(clip_w, clip_h, radius)
-    composited  = _apply_rounded_mask(under, surface, mask)
+    # 1-3. Build the brightened + blurred + frosted base surface.
+    under = frame[y0:y1, x0:x1]
+    surface = _glass_base(under, intensity)
 
-    # Splice the composited rect back into the frame.  Inside the
-    # rounded region we now have the glass surface; outside the
-    # rounded region (the four notional corner squares) we have the
-    # original under-frame pixels unchanged, exactly as the rounded
-    # mask intended.
-    frame[y0:y1, x0:x1] = composited
+    # 4-5-6. Layer the remaining three Liquid Glass components onto
+    #        the surface in panel-local coords.  Each mutates the
+    #        surface buffer in place; ordering is gradient -> shadow
+    #        -> rim so the rim (topmost visual layer) sits over the
+    #        gradient, not under it.
+    _glass_top_gradient(surface, mask)
+    _glass_bottom_shadow(surface, mask)
+    if clip_w == w and clip_h == h:
+        # Rim's corner arcs are only correct when the panel is fully
+        # on-screen.  On a clipped panel the rim is skipped rather
+        # than drawn at the wrong coordinates.
+        _glass_rim(surface, w, h, radius)
+
+    # Final composite: paint the surface over the original under-
+    # region through the rounded alpha mask.  Outside the rounded
+    # interior the original frame pixels survive untouched -- this is
+    # what makes the panel's corners read as carved rather than
+    # square-stamped onto the wallpaper.
+    frame[y0:y1, x0:x1] = _apply_rounded_mask(under, surface, mask)
 
 
 # ============================================================================

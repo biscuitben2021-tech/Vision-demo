@@ -55,10 +55,9 @@ from typing import Final
 import cv2
 
 from src.compositor import Compositor
-from src.design import load_font
+from src.design import draw_fps_hud
 from phase1_canvas import (
     FPS_EMA_ALPHA,
-    FPS_FONT_SIZE,
     QUIT_KEY_ESC,
     QUIT_KEY_Q_L,
     QUIT_KEY_Q_U,
@@ -66,7 +65,12 @@ from phase1_canvas import (
     make_fullscreen_window,
     screen_size,
 )
-from phase4_home_screen import render_fps_below_bar
+# Note: previous versions imported FPS_FONT_SIZE from phase1 and
+# render_fps_below_bar from phase4.  Both were removed when the FPS
+# counter was centralised into src.design.draw_fps_hud (top-right,
+# dim grey, internally cached font).  The new helper is called below
+# AFTER the compositor returns its frame so the counter sits on top
+# of the OS chrome instead of below the status bar.
 from phase5_motion import (
     now_ms_relative,
     reduced_motion_requested_via_cli,
@@ -257,7 +261,8 @@ def main() -> None:
         or reduced_motion_requested_via_keypoll()
     )
 
-    fps_font = load_font(role="text", size=FPS_FONT_SIZE)
+    # FPS HUD's font is cached internally by draw_fps_hud; no per-loop
+    # font handle to thread through main().
     compositor = Compositor(reduced_motion=reduced_motion)
     ctx = _MainLoopContext()
 
@@ -301,9 +306,11 @@ def main() -> None:
 
         # FPS counter sits OUTSIDE the compositor: it's a diagnostic
         # surface, not part of the OS chrome the audience should see.
-        # `render_fps_below_bar` anchors it below the status bar in
-        # the top-right -- same placement phase4/5/6 use.
-        render_fps_below_bar(frame, f"{fps_ema:5.1f} fps", fps_font, canvas_w)
+        # draw_fps_hud anchors it 20px from the top-right corner in
+        # dim grey TEXT_TERTIARY -- identical anchor across every
+        # phase, drawn last so the status bar and any sliding
+        # notification cannot occlude it.
+        draw_fps_hud(frame, fps_ema)
 
         cv2.imshow(WINDOW_NAME, frame)
 

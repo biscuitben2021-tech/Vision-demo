@@ -65,14 +65,14 @@ from src.design import (
     NAV_HEIGHT,
     RADIUS_APP_ICON,
     TEXT_ON_DARK_RGB,
+    draw_fps_hud,
     draw_text,
     load_font,
+    make_canvas as _design_make_canvas,
 )
 from src.icons import draw_app_icon, draw_glass_panel
 from phase1_canvas import (
     FPS_EMA_ALPHA,
-    FPS_FONT_SIZE,
-    FPS_MARGIN,
     QUIT_KEY_ESC,
     QUIT_KEY_Q_L,
     QUIT_KEY_Q_U,
@@ -322,37 +322,17 @@ def paint_grid(canvas: np.ndarray, canvas_w: int) -> None:
         paint_tile(canvas, tile_x, tile_y, app_id, display_name, label_font)
 
 
-def render_fps_below_bar(
-    canvas: np.ndarray,
-    fps_text: str,
-    fps_font,
-    canvas_w: int,
-) -> None:
-    """Draw the FPS counter just below the status bar in the top-right.
-
-    Why not reuse phase1.render_fps verbatim:  that helper anchors the
-    text to y=FPS_MARGIN (16px from the top of the canvas), which would
-    place it INSIDE the 44px status bar -- competing with the clock
-    placeholder for the same corner.  Two right-aligned strings stacked
-    on top of each other in a 44px bar reads as cluttered.
-
-    Our solution: anchor below the bar instead, at
-    (NAV_HEIGHT + FPS_MARGIN).  The FPS counter is a development /
-    diagnostic surface; it should be visible to whoever's debugging
-    the demo without competing visually with the clock.  Pushing it
-    below the status bar keeps both readable.
-    """
-    # getlength returns the typographic advance width -- the right
-    # number to subtract from the right edge for tight right-alignment.
-    # Same idiom phase1.render_fps uses.
-    text_w = int(fps_font.getlength(fps_text))
-    draw_text(
-        canvas, fps_text,
-        x=canvas_w - text_w - FPS_MARGIN,
-        y=NAV_HEIGHT + FPS_MARGIN,
-        color_rgb=TEXT_ON_DARK_RGB,
-        font=fps_font,
-    )
+# NOTE: An earlier version of this file defined `render_fps_below_bar`
+# which anchored the FPS counter at (canvas_w - 16, NAV_HEIGHT + 16) in
+# TEXT_ON_DARK_RGB (near-white).  That helper was the source of the
+# "FPS in the wrong place, wrong colour" bug: the counter sat directly
+# under the status bar, painted bright on dark, which both clashed
+# with the clock placement and stayed bright when an app's light
+# wallpaper paged in.  The canonical FPS HUD now lives in
+# `src.design.draw_fps_hud` (top-right, 20px inset, TEXT_TERTIARY_RGB
+# dim grey, drawn as the LAST paint each frame so nothing occludes it).
+# Every phase that previously called `render_fps_below_bar` has been
+# routed through `draw_fps_hud`; the old helper has been removed.
 
 
 # ----------------------------------------------------------------------------
@@ -391,16 +371,22 @@ def _get_label_font():
 def make_dark_canvas(width: int, height: int) -> np.ndarray:
     """Return a fresh BGR canvas painted with BG_DARK (pure black).
 
-    Phase 1's `make_canvas` paints BG_LIGHT, which is correct for
+    Phase 1's `make_canvas` defaults to BG_LIGHT, which is correct for
     marketing pages but wrong for the visionOS home screen -- the
     home wallpaper is the one place in this demo where pure #000 is
-    the designed colour, per CLAUDE.md.  We allocate a parallel
-    helper here rather than parametrising the Phase 1 one so each
-    phase's wallpaper choice is explicit at the call site.
+    the designed colour, per CLAUDE.md.  This helper now delegates to
+    `src.design.make_canvas` with `color=BG_DARK_BGR` so the actual
+    allocation logic lives in one place; only the choice of
+    wallpaper colour stays as a per-phase decision.
+
+    Crucial property: the ENTIRE canvas comes back pre-filled with
+    BG_DARK_BGR.  No subsequent paint in `_render_home` /
+    `_compose_screen` may leave any pixel in the wrong wallpaper colour;
+    that is the contract this factory upholds and the reason every
+    home-screen rendering path routes through it (including the
+    transition-side sub-buffers in `src.compositor`).
     """
-    canvas = np.empty((height, width, 3), dtype=np.uint8)
-    canvas[:, :] = BG_DARK_BGR
-    return canvas
+    return _design_make_canvas(width, height, BG_DARK_BGR)
 
 
 # ----------------------------------------------------------------------------
@@ -411,7 +397,8 @@ def main() -> None:
     """Run the Phase 4 fullscreen loop until ESC or Q is pressed."""
     make_fullscreen_window(WINDOW_NAME)
 
-    fps_font = load_font(role="text", size=FPS_FONT_SIZE)
+    # FPS HUD owns its own font cache (see src.design.draw_fps_hud);
+    # only the status-bar fonts need preloading at this scope.
     wordmark_font, clock_font = _get_status_bar_fonts()
 
     width, height = screen_size(WINDOW_NAME)
@@ -455,11 +442,13 @@ def main() -> None:
         #      of any tiles that happen to extend into the top 44px --
         #      they don't, by layout, but the order makes the
         #      occlusion correct if a future tile bleeds up).
-        #   3. FPS counter (sits below the status bar in the top-right,
-        #      not inside it -- see render_fps_below_bar for WHY).
+        #   3. FPS counter -- ABSOLUTE LAST paint, anchored in the
+        #      top-right corner via draw_fps_hud.  Drawing it last is
+        #      what guarantees the status bar (which sits in the same
+        #      top edge of the canvas) never occludes the counter.
         paint_grid(canvas, width)
         paint_status_bar(canvas, width, wordmark_font, clock_font)
-        render_fps_below_bar(canvas, f"{fps_ema:5.1f} fps", fps_font, width)
+        draw_fps_hud(canvas, fps_ema)
 
         cv2.imshow(WINDOW_NAME, canvas)
 

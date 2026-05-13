@@ -63,14 +63,13 @@ from src.design import (
     NAV_HEIGHT,
     RADIUS_APP_ICON,
     TEXT_ON_DARK_RGB,
+    draw_fps_hud,
     draw_text,
-    load_font,
 )
 from src.icons import draw_app_icon, draw_glass_panel
 from src.motion import FadeUpState, HoverState
 from phase1_canvas import (
     FPS_EMA_ALPHA,
-    FPS_FONT_SIZE,
     QUIT_KEY_ESC,
     QUIT_KEY_Q_L,
     QUIT_KEY_Q_U,
@@ -92,7 +91,6 @@ from phase4_home_screen import (
     grid_size,
     make_dark_canvas,
     paint_status_bar,
-    render_fps_below_bar,
     tile_origin,
 )
 
@@ -656,8 +654,9 @@ def main() -> None:
     )
 
     # Font loads, mirroring Phase 4's pattern.  Reused per frame via
-    # the module-level cache in phase4_home_screen / src.tiles.
-    fps_font = load_font(role="text", size=FPS_FONT_SIZE)
+    # the module-level cache in phase4_home_screen / src.tiles.  The
+    # FPS HUD's font is owned by `draw_fps_hud` (cached internally),
+    # so it doesn't appear in this preload list.
     wordmark_font, clock_font = _get_status_bar_fonts()
     label_font = _get_label_font()
 
@@ -711,10 +710,12 @@ def main() -> None:
         # Paint order (back to front):
         #   1. Grid of tiles with motion (fade-up + hover scale)
         #   2. Status bar over the wallpaper / any bleeding tile pixels
-        #   3. FPS counter below the status bar in the top-right
+        #   3. FPS counter in the top-right corner -- ABSOLUTE LAST
+        #      paint so neither the status bar nor any future overlay
+        #      can occlude it.
         paint_grid_with_motion(canvas, geometry, motion, label_font, now_ms)
         paint_status_bar(canvas, width, wordmark_font, clock_font)
-        render_fps_below_bar(canvas, f"{fps_ema:5.1f} fps", fps_font, width)
+        draw_fps_hud(canvas, fps_ema)
 
         cv2.imshow(WINDOW_NAME, canvas)
 

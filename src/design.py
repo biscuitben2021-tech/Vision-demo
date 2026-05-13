@@ -416,3 +416,146 @@ def draw_text(
 
     # Standard "over" compositing: out = src*a + dst*(1-a).  In place.
     frame[y0:y1, x0:x1] = (a * src + (1.0 - a) * dst).astype(np.uint8)
+
+
+# ============================================================================
+# Canvas factory + FPS HUD
+# ============================================================================
+#
+# Two utilities every phase needs and which were previously duplicated
+# (phase1's `make_canvas` painted BG_LIGHT; phase4's `make_dark_canvas`
+# painted BG_DARK; each phase rolled its own FPS-rendering helper at a
+# different y-anchor and a different colour).  Centralising them here
+# means:
+#   * Every phase pulls its background-fill from one place, so a future
+#     wallpaper swap touches one constant rather than seven phase scripts.
+#   * The FPS counter sits at exactly the same screen coordinate in every
+#     phase, in the same dim tertiary colour, so a developer's eye learns
+#     one anchor regardless of which phase is being run for development.
+#
+# Both helpers live in this module because they are pure design-token
+# applications: a colour and a font, rendered into the BGR frame.  Putting
+# them in src/icons or src/tiles would couple them to the glass/tile
+# vocabulary they are deliberately separate from.
+
+
+def make_canvas(
+    width: int,
+    height: int,
+    color: tuple[int, int, int] = BG_LIGHT_BGR,
+) -> np.ndarray:
+    """Return a fresh BGR canvas painted with `color`.
+
+    Default is BG_LIGHT_BGR -- #fbfbfd, the warm near-white the marketing
+    phases (Phases 1-3) are built on.  The home-screen / app-window phases
+    (Phases 4+) pass BG_DARK_BGR to start the canvas pure black, which is
+    the visionOS wallpaper.  Pure white (255, 255, 255) is NEVER the right
+    answer here -- Apple's restraint is to never use pure white as a page
+    surface; the warm near-white is what makes a rendered tile read as
+    paper rather than as a fluorescent bulb.
+
+    Why this lives in src/design rather than per-phase: a previous version
+    of the demo had each phase paint its own background fill at the top of
+    main(), which led to a class of bug where the home-screen path would
+    end up with a near-white strip at the top of the canvas before the
+    BG_DARK fill landed.  Routing every phase through a single factory
+    closes that gap by construction -- you cannot forget to fill the
+    background if creating the canvas IS the fill.
+
+    Args:
+        width, height: pixel extents.  Allocated as shape (height, width, 3)
+                       to match cv2's row-major buffer layout.
+        color:         BGR tuple in 0..255.  Defaults to BG_LIGHT_BGR so
+                       existing callers (phase1/2/3) that don't pass a
+                       colour keep their marketing-page background.
+
+    Returns:
+        A fresh uint8 BGR ndarray of shape (height, width, 3) painted
+        uniformly with `color`.
+    """
+    canvas = np.empty((height, width, 3), dtype=np.uint8)
+    # Slice assignment to the BGR triple broadcasts across every pixel in
+    # one numpy pass -- significantly faster than np.full for the same
+    # result, and clearer than np.empty + cv2.rectangle.
+    canvas[:, :] = color
+    return canvas
+
+
+# FPS HUD anchor.  The prompt fixes this at (frame_w - 20, 20) so the
+# counter sits 20px from the top-right corner -- close enough to be
+# unobtrusive but far enough from the edge to read at glance distance.
+# Used by `draw_fps_hud` below; pulled out as constants so future tweaks
+# touch one site rather than the call body.
+_FPS_HUD_MARGIN: Final[int] = 20
+
+# Footnote size -- matches the "Small / footnote" row of the typography
+# table in apple_SKILL.md.  The FPS counter is a diagnostic surface, not
+# part of the OS chrome, so it pulls the smallest type token.
+_FPS_HUD_FONT_SIZE: Final[int] = 12
+
+
+def _get_fps_hud_font() -> ImageFont.FreeTypeFont:
+    """Return the cached SF Pro Text Regular 12px font for the FPS counter.
+
+    PIL truetype loads are not free -- opening the font file and parsing
+    its table directory is measurable at 60Hz on the M2.  Same caching
+    idiom `src/tiles._get_tile_fonts` uses: state lives on the function
+    object, not at module scope, so importing this module is side-effect
+    free.
+
+    The font's role and size are fixed (the FPS counter is the only call
+    site) so we don't expose them as parameters -- the function returns
+    the one font this HUD needs, full stop.
+    """
+    cached = getattr(_get_fps_hud_font, "_cache", None)
+    if cached is None:
+        cached = load_font(role="text", size=_FPS_HUD_FONT_SIZE)
+        _get_fps_hud_font._cache = cached  # type: ignore[attr-defined]
+    return cached
+
+
+def draw_fps_hud(frame: np.ndarray, fps: float) -> None:
+    """Render the FPS counter into the absolute top-right of `frame`.
+
+    Anchored at (frame_w - 20, 20) with align="right" and color
+    TEXT_TERTIARY_RGB so it can sit unobtrusively on top of any
+    background -- light page, dark home screen, mid-transition blend.
+
+    Must be the LAST thing drawn each frame; otherwise the status bar
+    or a sliding notification will paint over it.
+
+    The colour deliberately is TEXT_TERTIARY_RGB (#6e6e73) -- a dim grey
+    that reads against both light and dark surfaces without competing
+    with foreground content.  Earlier phases painted the FPS counter in
+    TEXT_ON_DARK_RGB (#f5f5f7, near-white), which read fine on the dark
+    home screen but became a bright blob against light-app wallpapers
+    (Photos, Notes, etc.).  Tertiary is the colour the design system
+    reserves for "legible but ignorable" diagnostics.
+
+    Args:
+        frame: BGR uint8 ndarray, mutated in place.  Must be the
+               renderer's final output -- this helper is the last paint
+               in the pipeline.
+        fps:   the current frames-per-second value to display.  Formatted
+               internally as `f"{fps:5.1f} fps"` so every phase shows the
+               exact same string format.
+
+    The colour-space convention: this helper accepts a BGR `frame`
+    (cv2's native format) and forwards an RGB colour to `draw_text`,
+    which handles the cv2/PIL byte-order translation internally.  No
+    raw BGR/RGB tuples are introduced here.
+    """
+    h, w = frame.shape[:2]
+    font = _get_fps_hud_font()
+    # f"{fps:5.1f} fps" keeps the digit count stable (e.g. "22.9 fps",
+    # " 9.7 fps") so the right-aligned anchor doesn't visually jitter
+    # by one glyph width as the EMA crosses 10/100 fps boundaries.
+    text = f"{fps:5.1f} fps"
+    draw_text(
+        frame, text,
+        x=w - _FPS_HUD_MARGIN,
+        y=_FPS_HUD_MARGIN,
+        color_rgb=TEXT_TERTIARY_RGB,
+        font=font,
+        align="right",
+    )

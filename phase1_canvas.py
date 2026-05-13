@@ -33,9 +33,8 @@ import numpy as np
 
 from src.design import (
     BG_LIGHT_BGR,
-    TEXT_TERTIARY_RGB,
-    draw_text,
-    load_font,
+    draw_fps_hud,
+    make_canvas as _design_make_canvas,
 )
 
 
@@ -70,13 +69,15 @@ QUIT_KEY_Q_U:  Final[int] = ord("Q")
 DEFAULT_W: Final[int] = 1920
 DEFAULT_H: Final[int] = 1080
 
-# FPS counter placement and styling.
-FPS_FONT_SIZE: Final[int] = 12   # matches the "Small / footnote" type token
-FPS_MARGIN:    Final[int] = 16   # px gap from the top and right edges
-
 # Exponential-moving-average smoothing for the FPS counter.  Pure
 # instantaneous FPS bounces between ~58 and ~62 on a healthy 60Hz loop;
-# the EMA pins the reading to its steady state with minimal lag.
+# the EMA pins the reading to its steady state with minimal lag.  The
+# FPS HUD's font and screen anchor used to live here as FPS_FONT_SIZE /
+# FPS_MARGIN constants; they are now owned by `src.design.draw_fps_hud`
+# so every phase pulls the same anchor from one place.  Phase 4's old
+# "below-the-bar" anchor (NAV_HEIGHT + FPS_MARGIN, near-white colour)
+# was the source of the "wrong place, wrong colour" bug; routing all
+# phases through `draw_fps_hud` fixes that by construction.
 FPS_EMA_ALPHA: Final[float] = 0.1
 
 
@@ -109,45 +110,21 @@ def screen_size(window_name: str) -> tuple[int, int]:
 def make_canvas(width: int, height: int) -> np.ndarray:
     """Return a fresh BGR canvas painted with BG_LIGHT.
 
-    BG_LIGHT is #fbfbfd, never pure #ffffff.  Apple's restraint: pure
-    white reads as a fluorescent bulb and crushes the highlight on every
-    rounded tile we draw later; the warm near-white gives the design
-    room to breathe.  This single line is the foundation the entire
-    aesthetic stands on.
+    Thin alias around `src.design.make_canvas` so existing Phase 1-3
+    callers (which import `make_canvas` from this module) keep working
+    unchanged after the canvas factory was hoisted into `src.design`.
+    The shared factory takes a `color` parameter; we pass BG_LIGHT_BGR
+    here to preserve Phase 1's marketing-page wallpaper, while phase4+
+    pass BG_DARK_BGR via `make_dark_canvas` for the visionOS home screen.
 
     Shape is (h, w, 3) uint8, the canonical cv2 BGR buffer layout.
     """
-    canvas = np.empty((height, width, 3), dtype=np.uint8)
-    canvas[:, :] = BG_LIGHT_BGR
-    return canvas
-
-
-def render_fps(
-    canvas: np.ndarray,
-    fps_text: str,
-    font,  # PIL ImageFont; type left implicit to avoid pulling PIL into the signature
-    canvas_w: int,
-) -> None:
-    """Draw the FPS string right-aligned to (canvas_w - FPS_MARGIN, FPS_MARGIN)."""
-    # `font.getlength` gives the rendered advance width -- the proper
-    # number to subtract from the right edge for tight right-alignment.
-    # getbbox would over-include side bearings and leave the text drifted
-    # a couple pixels off the edge.
-    text_w = int(font.getlength(fps_text))
-    draw_text(
-        canvas,
-        fps_text,
-        x=canvas_w - text_w - FPS_MARGIN,
-        y=FPS_MARGIN,
-        color_rgb=TEXT_TERTIARY_RGB,
-        font=font,
-    )
+    return _design_make_canvas(width, height, BG_LIGHT_BGR)
 
 
 def main() -> None:
     """Run the Phase 1 fullscreen loop until ESC or Q is pressed."""
     make_fullscreen_window(WINDOW_NAME)
-    fps_font = load_font(role="text", size=FPS_FONT_SIZE)
 
     width, height = screen_size(WINDOW_NAME)
     canvas = make_canvas(width, height)
@@ -186,8 +163,11 @@ def main() -> None:
                      + (1.0 - FPS_EMA_ALPHA) * fps_ema
             )
 
-        # Right-aligned tertiary text, top-right corner.
-        render_fps(canvas, f"{fps_ema:5.1f} fps", fps_font, width)
+        # Right-aligned tertiary text, top-right corner.  Anchor + font
+        # + colour all live inside draw_fps_hud; this call site is the
+        # last paint in the frame so the FPS counter never gets occluded
+        # by a status bar or notification in later phases.
+        draw_fps_hud(canvas, fps_ema)
 
         cv2.imshow(WINDOW_NAME, canvas)
 

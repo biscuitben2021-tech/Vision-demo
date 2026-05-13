@@ -68,12 +68,11 @@ from src.design import (
     GAP_VIEWPORT,
     TEXT_ON_DARK_RGB,
     TEXT_ON_LIGHT_RGB,
-    load_font,
+    draw_fps_hud,
 )
 from src.icons import draw_glass_panel
 from phase1_canvas import (
     FPS_EMA_ALPHA,
-    FPS_FONT_SIZE,
     QUIT_KEY_ESC,
     QUIT_KEY_Q_L,
     QUIT_KEY_Q_U,
@@ -87,8 +86,13 @@ from phase4_home_screen import (
     _get_status_bar_fonts,
     make_dark_canvas,
     paint_status_bar,
-    render_fps_below_bar,
 )
+# Note: previous versions also imported render_fps_below_bar from
+# phase4_home_screen; that helper was deleted when the FPS counter was
+# centralised in src.design.draw_fps_hud (top-right, dim grey, anchored
+# 20px from the corner).  The same draw_fps_hud is now called from
+# main() AFTER the per-screen paint, so _paint_home and _paint_app no
+# longer take fps_font / fps_text arguments.
 from phase5_motion import (
     GridGeometry,
     MotionState,
@@ -384,11 +388,9 @@ def _paint_home(
     label_font,
     wordmark_font,
     clock_font,
-    fps_font,
-    fps_text: str,
     now_ms: int,
 ) -> None:
-    """Paint the HOME screen exactly as Phase 5 does: grid + status + FPS.
+    """Paint the HOME screen exactly as Phase 5 does: grid + status.
 
     Order matters back-to-front:
         1. The black wallpaper is already in the canvas from main's
@@ -397,18 +399,18 @@ def _paint_home(
         3. The status bar covers the top 44px of any bleeding tile
            pixels (the layout has no overlap by design, but the order
            keeps the occlusion correct if a future tile bleeds up).
-        4. The FPS counter sits below the status bar in the top-right.
+
+    The FPS counter is NOT painted here -- main() draws it last via
+    draw_fps_hud so it stays in the top-right corner of every phase
+    and never gets occluded by the status bar.
     """
     paint_grid_with_motion(canvas, geometry, motion, label_font, now_ms)
     paint_status_bar(canvas, width, wordmark_font, clock_font)
-    render_fps_below_bar(canvas, fps_text, fps_font, width)
 
 
 def _paint_app(
     canvas: np.ndarray,
     open_app_id: str,
-    fps_font,
-    fps_text: str,
     width: int,
 ) -> None:
     """Paint the APP_OPEN screen: app contents fullscreen, then chrome.
@@ -419,26 +421,18 @@ def _paint_app(
            else light).  We do NOT pre-fill before calling it -- the
            renderer's _fill is the first call inside.
         2. Close button sits on top of the app content at the top-left.
-        3. FPS counter -- same diagnostic surface as HOME.  Anchored
-           below where the status bar would be on HOME so a developer
-           reading the screen during the demo always knows where to
-           glance.
 
     No status bar on APP_OPEN.  visionOS apps are immersive; the
     system bar collapses when an app is foregrounded.
+
+    FPS counter is drawn by main() AFTER this returns, via
+    draw_fps_hud -- same anchor as HOME so a developer's eye learns
+    one screen position regardless of which state is active.
     """
     renderer = RENDERERS[open_app_id]
     renderer(canvas, width, canvas.shape[0])   # type: ignore[operator]
 
     _draw_close_button(canvas, open_app_id)
-
-    # FPS counter sits in the same screen position as on HOME so a
-    # developer's eye learns one anchor.  Reusing render_fps_below_bar
-    # means the colour is TEXT_ON_DARK -- which reads fine on light
-    # backgrounds because the FPS is small and grey-ish; the call site
-    # in render_fps_below_bar uses TEXT_ON_DARK_RGB but the function
-    # is colour-flexible if a future polish pass wants to switch it.
-    render_fps_below_bar(canvas, fps_text, fps_font, width)
 
 
 # ----------------------------------------------------------------------------
@@ -468,7 +462,8 @@ def main() -> None:
     """Run the Phase 6 fullscreen loop until ESC or Q is pressed."""
     make_fullscreen_window(WINDOW_NAME)
 
-    fps_font = load_font(role="text", size=FPS_FONT_SIZE)
+    # FPS HUD's font is cached internally inside draw_fps_hud; only the
+    # status-bar fonts need preloading at this scope.
     wordmark_font, clock_font = _get_status_bar_fonts()
     label_font = _get_label_font()
 
@@ -512,7 +507,6 @@ def main() -> None:
             )
 
         now_ms = now_ms_relative(t0_ticks)
-        fps_text = f"{fps_ema:5.1f} fps"
 
         # Dispatch on the current screen state.  Keeping the dispatch
         # at this single point (rather than scattering app-vs-home
@@ -522,7 +516,7 @@ def main() -> None:
             _paint_home(
                 canvas, width, geometry, motion,
                 label_font, wordmark_font, clock_font,
-                fps_font, fps_text, now_ms,
+                now_ms,
             )
         else:
             # Defensive: open_app_id is the source of truth for which
@@ -531,10 +525,11 @@ def main() -> None:
             if app_state.open_app_id is None:
                 app_state.state = "home"
                 continue
-            _paint_app(
-                canvas, app_state.open_app_id,
-                fps_font, fps_text, width,
-            )
+            _paint_app(canvas, app_state.open_app_id, width)
+
+        # FPS counter is the ABSOLUTE last paint -- top-right corner,
+        # dim grey, never occluded by the status bar or any chrome.
+        draw_fps_hud(canvas, fps_ema)
 
         cv2.imshow(WINDOW_NAME, canvas)
 

@@ -65,19 +65,17 @@ from src.design import (
     BG_LIGHT_BGR,
     GAP_TILE,
     GAP_VIEWPORT,
-    load_font,
+    draw_fps_hud,
 )
 from src.tiles import draw_tile
 from phase1_canvas import (
     FPS_EMA_ALPHA,
-    FPS_FONT_SIZE,
     QUIT_KEY_ESC,
     QUIT_KEY_Q_L,
     QUIT_KEY_Q_U,
     WINDOW_NAME,
     make_canvas,
     make_fullscreen_window,
-    render_fps,
     screen_size,
 )
 
@@ -203,9 +201,9 @@ def main() -> None:
     """Run the Phase 3 fullscreen loop until ESC or Q is pressed."""
     make_fullscreen_window(WINDOW_NAME)
 
-    # FPS font is the only one this module loads directly; the tile
-    # renderer caches its own four fonts internally on first draw.
-    fps_font = load_font(role="text", size=FPS_FONT_SIZE)
+    # The tile renderer caches its own four fonts internally on first
+    # draw; the FPS HUD's font is owned by `draw_fps_hud`.  Nothing to
+    # preload at this scope.
 
     width, height = screen_size(WINDOW_NAME)
     canvas = make_canvas(width, height)
@@ -244,13 +242,13 @@ def main() -> None:
             )
 
         # 4 tiles + top-right FPS counter.  The order matters only in
-        # that paint_grid must run before render_fps so the FPS string
+        # that paint_grid must run before draw_fps_hud so the FPS string
         # is never accidentally drawn under a tile that overlaps the
         # top-right corner -- it won't on a 2x2, but Phase 4's home
-        # screen has more cells.  Establishing the order here keeps it
-        # stable across the phase progression.
+        # screen has more cells.  draw_fps_hud is the last paint by
+        # convention across every phase.
         paint_grid(canvas, width, height)
-        render_fps(canvas, f"{fps_ema:5.1f} fps", fps_font, width)
+        draw_fps_hud(canvas, fps_ema)
 
         cv2.imshow(WINDOW_NAME, canvas)
 
