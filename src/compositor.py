@@ -76,7 +76,7 @@ from src.design import (
     draw_text,
     load_font,
 )
-from src.icons import draw_glass_panel
+from src.icons import draw_glass_panel, paint_warm_aurora
 from src.motion import ease_emphasized
 
 # Phase imports.  Same pattern Phase 6 uses to lean on Phase 5 / Phase 4
@@ -85,8 +85,11 @@ from src.motion import ease_emphasized
 # they don't have a top-level __all__ declaration.
 from phase4_home_screen import (
     APPS,
+    GRID_COLS,
     STATUS_BAR_PAD_X,
     STATUS_WORDMARK,
+    TILE_H,
+    TILE_W,
     _get_label_font,
     _get_status_bar_fonts,
     make_dark_canvas,
@@ -94,6 +97,7 @@ from phase4_home_screen import (
 from phase5_motion import (
     GridGeometry,
     MotionState,
+    _render_tile_with_motion,
     build_grid_geometry,
     build_motion_state,
     closest_tile,
@@ -104,6 +108,12 @@ from phase6_app_window import (
     _draw_close_button,
     _point_in_rect,
 )
+# FadeUpState is the per-tile entry-animation record.  Page 2+ uses
+# PRE-COMPLETED FadeUpStates (start_ms negative enough that .value()
+# immediately returns 1.0 opacity / 0.0 y-offset) so the swipe itself
+# IS the visual entry -- a second fade-up would compete with the user's
+# horizontal drag and look broken.
+from src.motion import FadeUpState as _FadeUpState
 
 
 # ============================================================================
@@ -167,6 +177,47 @@ NOTIFICATION_BODY_Y: int = 36
 # src/tiles.py and phase4_home_screen.py.
 NOTIFICATION_TITLE_FONT_SIZE: int = 14
 NOTIFICATION_BODY_FONT_SIZE: int = 13
+
+
+# ============================================================================
+# Multi-page home -- Phase 8 paging constants + roster for page 2+
+# ============================================================================
+#
+# Phase 8 adds a swipe-able home screen.  The hand drags horizontally;
+# the page contents follow the hand; on release the page snaps to the
+# nearest neighbour if the drag passed the threshold or back to the
+# current page otherwise.
+#
+# Visual model mirrors iPad / Vision Pro: hand moves LEFT -> tiles move
+# LEFT (toward off-screen-left) -> the RIGHT neighbour page slides in
+# from the right edge.  The threshold below is "if the cumulative
+# horizontal drag exceeds 25% of canvas_w, commit to the neighbour;
+# otherwise rubber-band back".  iPadOS uses ~25-30% for the same
+# decision; 25% feels right at this canvas size and matches the user's
+# stated brief.
+#
+# Snap animation duration is 250ms eased through ease_emphasized, the
+# same easing curve the rest of the demo uses for in-flight motion.
+# 250ms is short enough that the audience reads the page change as
+# direct manipulation and long enough that the new page reads as a
+# distinct surface rather than as a hard cut.
+
+PAGE_SNAP_DURATION_MS: int = 250
+PAGE_SWIPE_THRESHOLD_FRACTION: float = 0.25   # 25% of canvas_w; see block above
+
+# APPS_PAGE_2 is the roster for the SECOND home page.  Same eight
+# app_ids as phase4_home_screen.APPS but in a visibly different order
+# -- this is the simplest "page 2 looks different" rule that does not
+# require new icon glyphs / renderers.  Introducing fresh app_ids on
+# page 2 would have no entry in `src/apps.RENDERERS` and the open-app
+# path would crash; reusing the existing eight keeps every transition
+# valid.
+#
+# The order is APPS reversed: Demo first, Safari last.  Any arbitrary
+# permutation works; reversal is the most visually obvious
+# "different page" rearrangement at a glance.
+
+APPS_PAGE_2: list[tuple[str, str]] = list(reversed(APPS))
 
 
 # ============================================================================
@@ -603,6 +654,14 @@ class Compositor:
         type.
         """
         assert self.geometry is not None
+        # Paint the warm-aurora wallpaper as the first layer so the
+        # glass panels above it have varied content to refract through.
+        # The aurora is cached per resolution -- per-frame cost is just
+        # a single np.copyto.  Without this layer the underlying
+        # wallpaper is BG_DARK (#000) and the Liquid Glass effect
+        # becomes nearly invisible: blurring black yields black, and
+        # the frost tint reads as a flat darker rectangle.
+        paint_warm_aurora(frame, w, h)
         paint_grid_with_motion(
             frame, self.geometry, self.motion, self._label_font, now_ms,
         )

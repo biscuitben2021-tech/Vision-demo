@@ -182,6 +182,115 @@ _RIM_ALPHA: Final[float] = 0.5
 _MASK_CACHE: dict[tuple[int, int, int], np.ndarray] = {}
 
 
+# ============================================================================
+# Warm aurora wallpaper -- visionOS atmospheric backdrop
+# ============================================================================
+#
+# Pure-black home wallpaper makes the Liquid Glass effect nearly invisible
+# (blurring black produces black; the frost tint adds nothing visible on
+# a flat fill).  visionOS itself draws passthrough -- whatever's behind
+# the user's head -- with a soft tint applied.  We approximate that on a
+# laptop demo with three heavily-blurred radial color blobs over a
+# near-black baseline: warm purple upper-left, soft pink upper-right,
+# cool blue lower.  The result reads as "subtle ambient color" rather
+# than wallpaper-of-the-month: glass panels get varied content to
+# refract through, and `_glass_base`'s blur path activates (region.std()
+# > 5) so the refraction effect is actually visible.
+#
+# Composed at low resolution (64x40) then upsampled with Lanczos to the
+# full frame, plus a heavy Gaussian blur on the final result.  Cached
+# per (width, height) -- the wallpaper is static for the life of a
+# resolution; recomputing it every frame would burn ~30ms on the
+# 101x101 blur of a 1440x900 buffer.
+_AURORA_CACHE: dict[tuple[int, int], np.ndarray] = {}
+
+# Aurora blob palette.  All BGR.  Picked to land on the warm-purple-to-
+# cool-blue diagonal Apple uses for passthrough tints in marketing
+# renders.  Floats so we can lerp; the floor and scale below land them
+# in 0..255 uint8 space.
+_AURORA_BASELINE_BGR: Final[tuple[int, int, int]] = (12, 10, 14)
+_AURORA_BLOBS: Final[tuple[tuple[float, float, tuple[int, int, int], float], ...]] = (
+    # (cx_norm, cy_norm, color_bgr, sigma_norm)  in [0..1] normalized coords
+    (0.22, 0.18, (170, 55, 95),   0.32),   # warm purple,  upper-left
+    (0.78, 0.20, (195, 110, 180), 0.30),   # soft pink,    upper-right
+    (0.55, 0.78, (210, 145, 70),  0.36),   # cool blue,    lower-center
+)
+
+
+def _build_warm_aurora(w: int, h: int) -> np.ndarray:
+    """Build the warm-aurora wallpaper for a (w, h) frame.
+
+    Computed at low res for speed -- the heavy blur kills any
+    high-frequency detail anyway, so 64x40 is plenty of source even at
+    a 1440x900 final size.  Returned as a BGR uint8 array ready to
+    `frame[:] = result`.
+
+    Each blob is a Gaussian falloff: `exp(-((x-cx)^2 + (y-cy)^2) /
+    (2 * sigma^2))`.  Blob centres + sigmas are in normalised [0..1]
+    coords so the same colour layout holds at any final resolution.
+    """
+    sw, sh = 64, 40
+    aurora = np.full(
+        (sh, sw, 3), _AURORA_BASELINE_BGR, dtype=np.float32,
+    )
+    # numpy meshgrid in row-major (y, x) order, normalised to [0..1]
+    yy = np.linspace(0.0, 1.0, sh, dtype=np.float32)[:, None]
+    xx = np.linspace(0.0, 1.0, sw, dtype=np.float32)[None, :]
+
+    for cx, cy, color_bgr, sigma in _AURORA_BLOBS:
+        # Gaussian intensity per pixel -- broadcast across the (sh, sw)
+        # grid in one numpy pass.
+        d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+        falloff = np.exp(-d2 / (2.0 * sigma * sigma))[..., None]
+        aurora = aurora + falloff * np.array(color_bgr, dtype=np.float32)
+
+    np.clip(aurora, 0.0, 255.0, out=aurora)
+    aurora_u8 = aurora.astype(np.uint8)
+
+    # Lanczos upscale to full size, then a heavy Gaussian blur to wash
+    # away any banding that the upscale introduced.  Kernel size scales
+    # with frame width so the visual softness is consistent across
+    # resolutions; we round to the nearest odd int because cv2
+    # requires odd kernels.
+    upsampled = cv2.resize(
+        aurora_u8, (w, h), interpolation=cv2.INTER_LANCZOS4,
+    )
+    ksize = max(51, (w // 28) | 1)   # |1 forces odd
+    if ksize % 2 == 0:
+        ksize += 1
+    blurred = cv2.GaussianBlur(upsampled, (ksize, ksize), 0)
+
+    # Damp brightness so the aurora reads as atmospheric ambient
+    # colour rather than as a saturated photograph.  0.55 keeps the
+    # warm tones legible without competing with the foreground glass
+    # tiles.  Cast back to uint8 at the boundary.
+    damped = (blurred.astype(np.float32) * 0.55).astype(np.uint8)
+    return damped
+
+
+def paint_warm_aurora(frame: np.ndarray, w: int, h: int) -> None:
+    """Fill `frame[:h, :w]` with the cached warm-aurora wallpaper.
+
+    Replaces the pure-black home wallpaper.  The aurora is static --
+    same colours and gradient every frame -- so the bulk of the work
+    is done once per resolution and cached.  Per-frame cost is just a
+    single `np.copyto`, which is essentially free relative to the rest
+    of the compose pipeline.
+
+    `frame` is BGR uint8.  Mutated in place.
+    """
+    if w <= 0 or h <= 0:
+        return
+    key = (w, h)
+    cached = _AURORA_CACHE.get(key)
+    if cached is None:
+        cached = _build_warm_aurora(w, h)
+        _AURORA_CACHE[key] = cached
+    # np.copyto for in-place fill; faster than frame[:] = cached because
+    # it avoids a fresh allocation if shapes match exactly.
+    np.copyto(frame[:h, :w], cached)
+
+
 def _blur_kernel_size(intensity: float) -> int:
     """Pick an odd Gaussian kernel size for the given intensity.
 

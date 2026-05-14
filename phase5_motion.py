@@ -66,7 +66,7 @@ from src.design import (
     draw_fps_hud,
     draw_text,
 )
-from src.icons import draw_app_icon, draw_glass_panel
+from src.icons import draw_app_icon, draw_glass_panel, _get_rounded_mask
 from src.motion import FadeUpState, HoverState
 from phase1_canvas import (
     FPS_EMA_ALPHA,
@@ -302,32 +302,44 @@ def now_ms_relative(t0_ticks: int) -> int:
 #        with the same opacity applied via a sub-image alpha-blend.
 
 
-def _build_tile_subimage(app_id: str) -> np.ndarray:
-    """Return a fresh TILE_W x TILE_H BGR buffer with one tile rendered into it.
+def _build_tile_subimage(app_id: str) -> tuple[np.ndarray, np.ndarray]:
+    """Return (BGR sub-image, alpha mask) for one app icon, sized to the icon.
 
-    Pre-filled with BG_DARK_BGR so the glass panel's brighten-and-tint
-    pass has the correct underlying colour to read from.  If we left
-    the buffer uninitialised, the glass surface would read random
-    bytes as "wallpaper" and the tile would flicker every frame.
+    On visionOS the home-screen icons sit directly on the wallpaper --
+    there is no separate dark "tile chrome" framing each icon.  Earlier
+    versions of this renderer painted a glass panel under every icon,
+    which on a varied wallpaper (the aurora backdrop) produced a
+    visible dark rounded frame around each colourful icon.  We've
+    removed that chrome: the icon's own rounded coloured background
+    IS the visual.
 
-    The caller scales and composites this buffer; we do not do any
-    cropping or scaling here.  This keeps the render-vs-composite
-    split clean and lets _render_tile_with_motion focus on geometry.
+    The sub-image is built at ICON_SIZE x ICON_SIZE -- just big enough
+    to hold the icon -- so the paste origin can be offset from the
+    nominal TILE_W x TILE_H slot to centre it.  The accompanying mask
+    matches the icon's rounded silhouette (255 inside, 0 outside);
+    `_alpha_blend_subimage` uses it to keep the corner pixels of the
+    sub-image from covering the wallpaper.
+
+    Returns:
+        sub:   (ICON_SIZE, ICON_SIZE, 3) BGR uint8 -- the rendered icon.
+        mask:  (ICON_SIZE, ICON_SIZE)    uint8     -- alpha mask, 255 inside
+               the icon's rounded background, 0 outside.
     """
-    sub = np.empty((TILE_H, TILE_W, 3), dtype=np.uint8)
+    sub = np.empty((ICON_SIZE, ICON_SIZE, 3), dtype=np.uint8)
     sub[:, :] = BG_DARK_BGR
 
-    # Glass panel: same parameters as phase 4's paint_tile, but at the
-    # sub-image's origin (0, 0) rather than (tile_x, tile_y).
-    draw_glass_panel(sub, x=0, y=0,
-                     w=TILE_W, h=TILE_H, radius=RADIUS_APP_ICON)
-
-    # Icon centred inside the sub-image.
-    icon_cx = TILE_W // 2
-    icon_cy = TILE_H // 2
+    # Icon fills the whole sub-image: cx, cy at its centre, size = ICON_SIZE.
+    icon_cx = ICON_SIZE // 2
+    icon_cy = ICON_SIZE // 2
     draw_app_icon(sub, cx=icon_cx, cy=icon_cy,
                   size=ICON_SIZE, app_id=app_id)
-    return sub
+
+    # Rounded-rect mask matching the icon's own background shape.  The
+    # icon paints its rounded coloured bg AT RADIUS_APP_ICON, then a
+    # glyph on top -- this mask gives us the silhouette we need to
+    # keep the four corner pixels transparent during the composite.
+    mask = _get_rounded_mask(ICON_SIZE, ICON_SIZE, RADIUS_APP_ICON)
+    return sub, mask
 
 
 def _alpha_blend_subimage(
@@ -336,15 +348,23 @@ def _alpha_blend_subimage(
     paste_x: int,
     paste_y: int,
     opacity: float,
+    mask: np.ndarray | None = None,
 ) -> None:
     """Alpha-blend `sub` into `canvas` at (paste_x, paste_y) with `opacity`.
 
-    Standard "over" composite with a constant alpha across the whole
-    sub-image:  out = sub*opacity + canvas*(1-opacity).  Clipped to the
-    canvas extent -- off-screen pastes are a silent no-op rather than
-    an exception, matching draw_glass_panel / draw_text's contracts.
+    Standard "over" composite.  When `mask` is None the blend uses a
+    constant alpha across the whole sub-image:
+        out = sub * opacity + canvas * (1 - opacity).
+    When `mask` is provided (single-channel uint8, same H x W as `sub`),
+    the per-pixel alpha is `(mask / 255) * opacity`; pixels with
+    mask = 0 leave the canvas untouched, which is what makes the four
+    corner pixels of an icon's rounded background not cover the
+    aurora wallpaper underneath.
 
-    `sub` is read-only; `canvas` is mutated in place.
+    Clipped to the canvas extent -- off-screen pastes are a silent
+    no-op, matching `draw_glass_panel` / `draw_text`.
+
+    `sub` and `mask` are read-only; `canvas` is mutated in place.
     """
     canvas_h, canvas_w = canvas.shape[:2]
     sub_h, sub_w = sub.shape[:2]
@@ -366,7 +386,14 @@ def _alpha_blend_subimage(
 
     src = sub[sy0:sy1, sx0:sx1].astype(np.float32)
     dst = canvas[y0:y1, x0:x1].astype(np.float32)
-    out = src * opacity + dst * (1.0 - opacity)
+    if mask is None:
+        out = src * opacity + dst * (1.0 - opacity)
+    else:
+        # Per-pixel alpha.  Broadcast to (h, w, 1) so the multiply
+        # applies the same alpha to all three colour channels.
+        m = mask[sy0:sy1, sx0:sx1].astype(np.float32) * (opacity / 255.0)
+        m = m[..., np.newaxis]
+        out = src * m + dst * (1.0 - m)
     np.clip(out, 0.0, 255.0, out=out)
     canvas[y0:y1, x0:x1] = out.astype(np.uint8)
 
@@ -393,37 +420,48 @@ def _render_label_with_motion(
     and aligned so the label's horizontal centre sits over the tile's
     horizontal centre -- matching Phase 4's `paint_tile` placement.
     """
-    # Label band: matches Phase 4's exactly -- a horizontal slab the
+    # Label band: matches Phase 4's geometry -- a horizontal slab the
     # width of the tile, LABEL_BAND_HEIGHT tall, sitting
     # LABEL_GAP_FROM_TILE below the tile's resting bottom.
     band_x = tile_x
-    band_y = tile_y + TILE_H + LABEL_GAP_FROM_TILE
+    band_y = tile_y + TILE_H + LABEL_GAP_FROM_TILE + int(round(y_offset))
     band_w = TILE_W
     band_h = LABEL_BAND_HEIGHT
 
-    sub = np.empty((band_h, band_w, 3), dtype=np.uint8)
-    sub[:, :] = BG_DARK_BGR
+    # Clip the band to the canvas extent; if it's fully off-screen the
+    # label is a silent no-op (matches every other clipped renderer in
+    # this module).
+    canvas_h, canvas_w = canvas.shape[:2]
+    x0 = max(0, band_x); y0 = max(0, band_y)
+    x1 = min(canvas_w, band_x + band_w); y1 = min(canvas_h, band_y + band_h)
+    if x1 <= x0 or y1 <= y0:
+        return
 
-    # draw_text's `x` is the centre when align="center"; placing it at
-    # band_w//2 inside the sub-image gives a label centred horizontally
-    # within the tile's column.  `y=0` anchors the glyphs to the top of
-    # the sub-image.
-    draw_text(sub, display_name,
-              x=band_w // 2, y=0,
-              color_rgb=TEXT_ON_DARK_RGB, font=label_font, align="center")
-
-    # Composite with the fade-up offset and opacity applied.  Sub-pixel
-    # y-offsets are rounded to the nearest int (cv2 paste origin is
-    # integer-only) -- matching the rounding _render_tile_with_motion
-    # uses so the tile and its label stay vertically aligned during the
-    # fade-up.  At the 24px max offset on the eased curve, the rounding
-    # is imperceptible.
-    _alpha_blend_subimage(
-        canvas, sub,
-        paste_x=band_x,
-        paste_y=band_y + int(round(y_offset)),
-        opacity=opacity,
+    # Seed the sub-image with the wallpaper pixels that are currently
+    # under the band rather than with a flat BG_DARK fill.  This is what
+    # lets the label fade-up against a varied wallpaper without leaving
+    # a dark rectangle: when opacity == 1 the wallpaper-coloured pixels
+    # in the sub blend onto the same wallpaper pixels in the canvas and
+    # vanish, leaving only the glyph contribution; when opacity < 1
+    # the same vanishing math applies pro-rata, so partial opacity
+    # never reveals a dark slab.
+    sub = canvas[y0:y1, x0:x1].copy()
+    # Adjust text x for the clip offset so the glyph still centres on
+    # the tile column.
+    text_x = band_w // 2 - (x0 - band_x)
+    text_y = -(y0 - band_y)
+    draw_text(
+        sub, display_name,
+        x=text_x, y=text_y,
+        color_rgb=TEXT_ON_DARK_RGB, font=label_font, align="center",
     )
+
+    # Composite back over the same canvas slice at the given opacity.
+    # cv2.addWeighted is the fastest BGR uint8 lerp available; we use
+    # it instead of the float pipeline because the alpha is constant
+    # and we don't need per-pixel masking for the label.
+    dst = canvas[y0:y1, x0:x1]
+    cv2.addWeighted(sub, opacity, dst, 1.0 - opacity, 0.0, dst=dst)
 
 
 def _render_tile_with_motion(
@@ -437,42 +475,50 @@ def _render_tile_with_motion(
     y_offset: float,
     scale: float,
 ) -> None:
-    """Render one tile + label with fade-up + hover transformations applied.
+    """Render one app icon + label with fade-up + hover applied.
 
-    Steps mirror the pipeline laid out in the module's per-tile
-    renderer block above.  Scaling is around the tile's centre rather
-    than its top-left, so 1.02 reads as the tile lifting toward the
-    viewer rather than slumping toward the bottom-right.
+    The home-screen icons sit directly on the wallpaper -- no dark
+    tile chrome -- so we composite the smaller ICON_SIZE x ICON_SIZE
+    sub-image through a rounded mask, centred inside the nominal
+    TILE_W x TILE_H slot.  Hover scaling is applied around the
+    icon's visual centre so a 1.02 bump reads as a gentle lift
+    toward the viewer.
 
     Off-canvas pastes are silently clipped by _alpha_blend_subimage.
     """
-    # 1-2. Build the tile + icon sub-image (glass panel, app icon).
-    sub = _build_tile_subimage(app_id)
+    # 1. Build the icon sub-image plus its rounded silhouette mask.
+    sub, mask = _build_tile_subimage(app_id)
 
-    # 3. Apply the hover scale.  cv2.resize takes (w, h), not (h, w).
+    # 2. Apply the hover scale to BOTH the sub and the mask so the
+    #    silhouette grows / shrinks with the icon.  cv2.resize takes
+    #    (w, h), not (h, w).
     if scale != 1.0:
-        new_w = max(1, int(round(TILE_W * scale)))
-        new_h = max(1, int(round(TILE_H * scale)))
-        sub = cv2.resize(sub, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        new_w = max(1, int(round(ICON_SIZE * scale)))
+        new_h = max(1, int(round(ICON_SIZE * scale)))
+        sub  = cv2.resize(sub,  (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     else:
-        new_w, new_h = TILE_W, TILE_H
+        new_w, new_h = ICON_SIZE, ICON_SIZE
 
-    # 4. Centre-scaled paste origin.  Half the scale delta on each
-    #    axis moves the paste origin up and left, keeping the tile's
-    #    visual centre at (tile_x + TILE_W/2, tile_y + TILE_H/2 + y_offset).
-    dx = (new_w - TILE_W) // 2
-    dy = (new_h - TILE_H) // 2
-    paste_x = tile_x - dx
-    paste_y = tile_y - dy + int(round(y_offset))
+    # 3. Centre the (possibly scaled) icon inside the tile's nominal
+    #    slot.  The tile slot is TILE_W x TILE_H; the icon is smaller.
+    #    Half the scale delta moves the paste origin up and left so
+    #    the visual centre stays put as the icon hovers.
+    base_x = tile_x + (TILE_W - new_w) // 2
+    base_y = tile_y + (TILE_H - new_h) // 2
+    paste_x = base_x
+    paste_y = base_y + int(round(y_offset))
 
-    # 5. Alpha-blend the scaled tile into the canvas with `opacity`.
-    _alpha_blend_subimage(canvas, sub, paste_x, paste_y, opacity)
+    # 4. Composite the icon through its rounded mask with the fade
+    #    opacity applied as a constant multiplier.  Pixels outside the
+    #    rounded silhouette (mask=0) leave the wallpaper untouched --
+    #    no dark frame around the icon.
+    _alpha_blend_subimage(canvas, sub, paste_x, paste_y, opacity, mask=mask)
 
-    # 6. Label below the tile, with the same fade-up offset/opacity
-    #    but no scaling -- a 1.02 scale on the 13px label moves
-    #    pixels by sub-pixel amounts and produces no visible
-    #    difference, while keeping the label sharp avoids re-rastering
-    #    glyphs every frame on hover.
+    # 5. Label below the icon, with the same fade-up offset/opacity.
+    #    The new label renderer composites text onto a copy of the
+    #    wallpaper beneath it, so the band fades up cleanly without
+    #    leaving a dark rectangle when opacity < 1.
     _render_label_with_motion(
         canvas, tile_x, tile_y, display_name, label_font,
         y_offset=y_offset, opacity=opacity,

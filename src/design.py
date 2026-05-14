@@ -23,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Final
 
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -208,6 +209,56 @@ _SFNS_SEMIBOLD: Final[str] = "Semibold"
 _SFNS_REGULAR:  Final[str] = "Regular"
 
 
+# Text supersampling factor.  draw_text renders glyphs at this multiple
+# of the requested size into an oversized RGBA patch, then INTER_AREA-
+# downsamples back to the native bbox.  This is MSAA for text: the
+# downsample integrates more glyph detail per output pixel, producing
+# noticeably cleaner anti-aliased edges than PIL's direct render at the
+# native size.  2 is the sweet spot -- 3 or 4 give diminishing returns
+# while costing 9x / 16x more PIL render time.
+_TEXT_SUPERSAMPLE: Final[int] = 2
+
+# Cache of (font_id, supersample_factor) -> supersampled FreeTypeFont.
+# Loading a TrueType at a new size involves re-parsing the font file's
+# table directory, which is measurable at 60Hz across multiple draw_text
+# calls per frame.  We key by (id(font), supersample) because two fonts
+# loaded from the same path with the same size are functionally
+# identical for our pipeline; the id() lookup is O(1) and avoids us
+# having to track the variation name through every call.
+_SUPERSAMPLED_FONT_CACHE: dict[tuple[int, int], ImageFont.FreeTypeFont] = {}
+
+
+def _get_supersampled_font(
+    font: ImageFont.FreeTypeFont, supersample: int,
+) -> ImageFont.FreeTypeFont:
+    """Return a supersampled copy of `font` (sized `supersample`x).
+
+    The returned font is structurally identical to the input except for
+    its render size.  Variation (Semibold/Regular for SFNS) is preserved
+    by reading the active variation name from the original font and
+    re-applying it on the copy.  If PIL doesn't expose
+    `get_variation_by_axes()` (older versions), the copy renders at the
+    default weight -- ugly but functional.
+    """
+    key = (id(font), supersample)
+    cached = _SUPERSAMPLED_FONT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    big = ImageFont.truetype(font.path, size=font.size * supersample)
+    # Carry over the variation name if the source font has one.  PIL
+    # >= 9.5 exposes `get_variation_by_axes` which we can probe; older
+    # versions just fall through to the default weight.
+    variation_name = getattr(font, "_vd_variation_name", None)
+    if variation_name is not None:
+        try:
+            big.set_variation_by_name(variation_name)
+        except (OSError, AttributeError):
+            pass
+    _SUPERSAMPLED_FONT_CACHE[key] = big
+    return big
+
+
 def load_font(role: str, size: int) -> ImageFont.FreeTypeFont:
     """Return a PIL TrueType font for the given role and size.
 
@@ -244,6 +295,12 @@ def load_font(role: str, size: int) -> ImageFont.FreeTypeFont:
             font.set_variation_by_name(variation)
         except (OSError, AttributeError):
             pass
+        # Stash the variation name on the font object so the text
+        # supersampler can reapply it when it loads a 2x-sized copy of
+        # the same font.  Custom attributes on PIL fonts are persisted
+        # for the lifetime of the object; nothing else reads this
+        # field except `_get_supersampled_font`.
+        font._vd_variation_name = variation  # type: ignore[attr-defined]
         return font
 
     # Fallback: Helvetica Neue collection.
@@ -380,16 +437,37 @@ def draw_text(
     if width <= 0 or height <= 0:
         return
 
-    # Render onto a transparent RGBA patch.  Alpha 0 background means only
-    # the glyph itself contributes to the composite.
-    patch = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    # Supersample the text: render PIL at 2x the target size into an
+    # oversized RGBA patch, then cv2.INTER_AREA downsample back to the
+    # native bbox before compositing.  AREA-downsampling produces much
+    # cleaner anti-aliased glyph edges than PIL's direct render at the
+    # native size; the cost is a 4x bigger PIL render (small in absolute
+    # terms because text bboxes are tiny), traded for crisper text in
+    # the output buffer.  This is the rendering-equivalent of MSAA: we
+    # cannot fix the macOS HiDPI upscale that happens after imshow, but
+    # we CAN feed it a higher-quality source.
+    ss = _TEXT_SUPERSAMPLE
+    big_font = _get_supersampled_font(font, ss)
+    big_left, big_top, big_right, big_bottom = big_font.getbbox(text)
+    big_w = big_right - big_left
+    big_h = big_bottom - big_top
+    if big_w <= 0 or big_h <= 0:
+        return
+
+    # Render onto a transparent RGBA patch at supersampled size.  Alpha 0
+    # background means only the glyph itself contributes to the composite.
+    patch = Image.new("RGBA", (big_w, big_h), (0, 0, 0, 0))
     ImageDraw.Draw(patch).text(
-        (-left, -top), text, fill=color_rgb + (255,), font=font,
+        (-big_left, -big_top), text, fill=color_rgb + (255,), font=big_font,
     )
 
-    # PIL -> numpy.  Result is (H, W, 4) in RGBA order; we split alpha
-    # out and reverse the colour channels to land in BGR for the frame.
-    rgba = np.array(patch)
+    # PIL -> numpy at supersampled resolution, then INTER_AREA downsample
+    # to the target bbox.  INTER_AREA is the canonical "downsample with
+    # area averaging" filter -- mathematically equivalent to integrating
+    # the source pixels under each destination pixel, which is what you
+    # want for clean anti-aliased downscaling.
+    rgba_big = np.array(patch)
+    rgba = cv2.resize(rgba_big, (width, height), interpolation=cv2.INTER_AREA)
     bgr  = rgba[..., 2::-1]                              # R,G,B -> B,G,R
     alpha = rgba[..., 3:4].astype(np.float32) * (1.0 / 255.0)
 
@@ -559,3 +637,50 @@ def draw_fps_hud(frame: np.ndarray, fps: float) -> None:
         font=font,
         align="right",
     )
+
+
+# ============================================================================
+# HiDPI display wrapper
+# ============================================================================
+#
+# cv2.imshow on macOS Retina passes our BGR buffer to an NSImage and
+# AppKit upscales it to the window's physical backing layer.  The
+# upscale uses AppKit's default interpolation, which on text-heavy
+# content reads as soft / fuzzy.  Pre-scaling the buffer to 2x with
+# cv2.INTER_LANCZOS4 gives AppKit a higher-resolution source to start
+# from; Lanczos has a steeper frequency response than bicubic so glyph
+# edges land sharper.
+#
+# This is NOT the same as rendering the whole pipeline at 2x (which
+# would actually add information).  It's a "best effort with the
+# pixels we already have" pass that costs ~15-25ms per frame to upscale
+# 1440x900 -> 2880x1800, in exchange for crisper-than-default text.
+
+_HIDPI_SCALE: Final[int] = 2
+
+
+def hidpi_imshow(window_name: str, frame: np.ndarray) -> None:
+    """imshow with a Lanczos pre-upscale for crisper Retina display.
+
+    The cv2 window backing on a Retina Mac renders at twice the logical
+    pixel grid.  When we pass a 1x buffer to imshow, AppKit upsamples
+    it with its default bicubic, which makes 12-14px text read as soft.
+    Pre-upscaling with INTER_LANCZOS4 (sharper than bicubic) and then
+    letting AppKit display the already-scaled buffer 1:1 lands with
+    visibly crisper glyph edges.
+
+    Args:
+        window_name: cv2 window identifier (same one used by namedWindow).
+        frame:       BGR uint8 buffer at logical resolution.  Not mutated.
+
+    Cost: ~15-25ms per call on a 1440x900 source.  Counted against the
+    per-frame budget.  Phases that don't need it (Phase 1's canvas-only
+    demo) can keep calling cv2.imshow directly.
+    """
+    h, w = frame.shape[:2]
+    scaled = cv2.resize(
+        frame,
+        (w * _HIDPI_SCALE, h * _HIDPI_SCALE),
+        interpolation=cv2.INTER_LANCZOS4,
+    )
+    cv2.imshow(window_name, scaled)
