@@ -108,6 +108,52 @@ THUMB_TIP: int = 4
 INDEX_TIP: int = 8
 MID_MCP: int = 9                   # base knuckle of the middle finger -- palm-length anchor
 
+# --- Face mesh landmark indices (MediaPipe Face Mesh 478-point model
+# with refine_landmarks=True; the iris points 468..477 are ONLY present
+# when refine_landmarks is enabled).  Names match the eye-tracking
+# reference's phase3_features.py and the project CLAUDE.md so anyone
+# moving between the two projects sees the same numbers.  Note: "LEFT"
+# and "RIGHT" here are the SUBJECT's anatomical left/right; after we
+# cv2.flip the camera frame they appear on the OPPOSITE side of the
+# canvas.  For the gaze-baseline math that doesn't matter -- we average
+# both eyes' iris-in-eye position, so the swap cancels out.
+LEFT_IRIS: int = 468
+RIGHT_IRIS: int = 473
+LEFT_EYE_OUTER: int = 33           # nearest the ear
+LEFT_EYE_INNER: int = 133          # nearest the nose
+LEFT_EYE_TOP: int = 159
+LEFT_EYE_BOTTOM: int = 145
+RIGHT_EYE_OUTER: int = 263
+RIGHT_EYE_INNER: int = 362
+RIGHT_EYE_TOP: int = 386
+RIGHT_EYE_BOTTOM: int = 374
+
+# Face Mesh confidence thresholds.  Lower than the Hands defaults
+# because the face is usually larger in frame than a hand and stays
+# locked through the demo -- false positives are essentially zero.
+FACE_MIN_DETECT_CONF: float = 0.5
+FACE_MIN_TRACK_CONF: float = 0.5
+
+# Gaze smoothing.  Raw iris position jitters ~2-5px frame-to-frame even
+# when the user is staring at a fixed point; without smoothing the
+# cursor twitches enough that hovering a 140x140 tile feels unreliable.
+# An exponential moving average is the cheapest fix that still feels
+# responsive.  alpha=0.35 is a starting point -- higher = snappier but
+# noisier; lower = smoother but laggier.  Tune by feel during the demo.
+GAZE_SMOOTH_ALPHA: float = 0.35
+
+# Gaze-to-cursor gains.  When the iris moves ONE unit of normalised
+# iris-in-eye position (which spans ~0..1 across the full eye width),
+# the cursor moves this many canvas pixels per unit.  The defaults
+# below assume a 1920-wide canvas and a typical 0.15-unit iris range
+# across the comfortable gaze cone -- so a 0.15 shift produces a
+# ~720px cursor movement, roughly 38% of the canvas.  Multiplied by
+# the canvas dimensions at runtime to keep behaviour resolution-
+# independent.  Vertical gain is higher because the iris-in-eye y
+# range is much narrower than the x range (~0.05 vs ~0.15).
+GAZE_GAIN_X: float = 5.0
+GAZE_GAIN_Y: float = 9.0
+
 # --- Pinch thresholds (REFERENCE VALUES, do not retune lightly) ------
 # Hysteresis: easier to keep a pinch than to start one.  The reference's
 # extensive tuning notes apply word-for-word, see Hand controller copy
@@ -388,6 +434,81 @@ def _landmarks_to_points(
     return points
 
 
+def _normalised_iris_in_eye(
+    iris_x: float, iris_y: float,
+    inner_x: float, outer_x: float,
+    top_y: float, bottom_y: float,
+) -> tuple[float, float]:
+    """Return the iris position as a fraction of the eye-socket box.
+
+    Returns (x_norm, y_norm) where:
+        x_norm = 0  -> iris at the inner corner (nose side)
+        x_norm = 1  -> iris at the outer corner (ear side)
+        y_norm = 0  -> iris at the top lid
+        y_norm = 1  -> iris at the bottom lid
+
+    Forward-facing gaze sits near (0.5, 0.5).  Normalising in this
+    way makes the reading invariant to where the face is in the
+    frame and how big the face appears -- only the iris's position
+    relative to its eye-socket survives.
+
+    Degenerate frames (eye closed flat, lids collapse to a point)
+    would divide by zero; we guard with `or 1e-9` so the math stays
+    finite and the frame just produces a garbage reading that the
+    EMA smooths over.  The reference uses the same guard.
+    """
+    eye_w = outer_x - inner_x or 1e-9
+    eye_h = bottom_y - top_y or 1e-9
+    return (iris_x - inner_x) / eye_w, (iris_y - top_y) / eye_h
+
+
+def _compute_gaze_norm(
+    face_list: list[Any], frame_w: int, frame_h: int,
+) -> Optional[tuple[float, float]]:
+    """Average iris-in-eye position across both eyes; None if no face.
+
+    `face_list` is the `multi_face_landmarks` field straight off a
+    MediaPipe FaceMesh result, with `refine_landmarks=True` (required
+    for iris landmarks 468..477).  We average the two eyes' readings
+    to halve the noise -- iris-in-eye jitter is roughly independent
+    per eye, so the mean has ~sqrt(2) less variance than either eye
+    alone.
+
+    Returns None on no-face so the publisher knows to hold the last
+    reading.  Frame width/height are passed in (rather than read
+    from the landmarks themselves) because the landmarks are
+    already-normalised; multiplying by frame dims gives pixel coords
+    consistent with the camera buffer.
+    """
+    if not face_list:
+        return None
+    lms = face_list[0].landmark
+
+    def at(idx: int) -> tuple[float, float]:
+        # Pixel coords in the camera frame.  We do NOT need to clip
+        # here because the reading is invariant under uniform scale.
+        return lms[idx].x * frame_w, lms[idx].y * frame_h
+
+    lix, liy = at(LEFT_IRIS)
+    rix, riy = at(RIGHT_IRIS)
+    l_inner = at(LEFT_EYE_INNER)
+    l_outer = at(LEFT_EYE_OUTER)
+    l_top = at(LEFT_EYE_TOP)
+    l_bottom = at(LEFT_EYE_BOTTOM)
+    r_inner = at(RIGHT_EYE_INNER)
+    r_outer = at(RIGHT_EYE_OUTER)
+    r_top = at(RIGHT_EYE_TOP)
+    r_bottom = at(RIGHT_EYE_BOTTOM)
+
+    lx, ly = _normalised_iris_in_eye(
+        lix, liy, l_inner[0], l_outer[0], l_top[1], l_bottom[1],
+    )
+    rx, ry = _normalised_iris_in_eye(
+        rix, riy, r_inner[0], r_outer[0], r_top[1], r_bottom[1],
+    )
+    return ((lx + rx) * 0.5, (ly + ry) * 0.5)
+
+
 # ============================================================================
 # HandInputUnavailable -- the constructor's only failure mode
 # ============================================================================
@@ -579,6 +700,22 @@ class HandInput:
         # thumbnail painter does not look it up under the lock.
         self._connections = self._mp.solutions.hands.HAND_CONNECTIONS
 
+        # MediaPipe Face Mesh -- ALSO run on each camera frame so the
+        # gaze (iris-in-eye normalised position) can drive the OS
+        # cursor.  Sharing the same VideoCapture + the same background
+        # thread is the only way that works on macOS, where two
+        # simultaneous VideoCapture instances on the same device fight
+        # over the AVFoundation backing and one of them starves.
+        # refine_landmarks=True is REQUIRED -- without it the iris
+        # landmarks (468..477) don't exist in the output.
+        self._face_mesh = self._mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=FACE_MIN_DETECT_CONF,
+            min_tracking_confidence=FACE_MIN_TRACK_CONF,
+        )
+
         # Shared state guarded by `self._lock`.  The thread fills
         # these; step() and draw_thumbnail() read them.
         self._lock = threading.Lock()
@@ -586,6 +723,25 @@ class HandInput:
         self._latest_camera_bgr: Optional[np.ndarray] = None
         self._latest_landmarks: list[Any] = []   # list of mediapipe NormalizedLandmarkList
         self._latest_is_pinching: bool = False
+
+        # Gaze state.  All values are normalised iris-in-eye position,
+        # averaged across the two eyes:
+        #     0.5 ~= iris centred in the eye-socket (forward gaze)
+        #     <0.5 = iris shifted toward the nose
+        #     >0.5 = iris shifted toward the ear
+        # Vertical is similar (0.5 ~= middle of the lid opening).
+        # `_latest_gaze_norm` is None when no face is detected.
+        # `_gaze_baseline` is None until the user runs the calibration
+        # screen and captures their "looking at the center" reading.
+        # `_smoothed_gaze_norm` carries the EMA across frames so the
+        # cursor doesn't jitter on raw landmark noise.
+        self._latest_gaze_norm: Optional[tuple[float, float]] = None
+        self._smoothed_gaze_norm: Optional[tuple[float, float]] = None
+        self._gaze_baseline: Optional[tuple[float, float]] = None
+        # Face landmarks list -- one mediapipe NormalizedLandmarkList
+        # when a face is detected, [] otherwise.  Used by the
+        # calibration UI's overlay.
+        self._latest_face_landmarks: list[Any] = []
 
         # Canvas-size hint (the OS canvas the cursor and drag deltas
         # are computed against).  step() updates this; the thread
@@ -661,6 +817,109 @@ class HandInput:
     def camera_index(self) -> int:
         """The camera index this HandInput opened.  -1 if construction failed."""
         return self._chosen_index
+
+    # ------------------------------------------------------------------
+    # Gaze API -- read by the calibration screen and the OS main loop
+    # ------------------------------------------------------------------
+
+    def latest_gaze_norm(self) -> Optional[tuple[float, float]]:
+        """Return the latest smoothed (x_norm, y_norm) iris-in-eye reading.
+
+        None when no face has been detected yet.  Both axes sit near
+        0.5 for a forward gaze; offsets toward 0 or 1 indicate the
+        iris has shifted left/right (x) or up/down (y) within the
+        eye-socket box.  The reading is averaged across both eyes and
+        EMA-smoothed by GAZE_SMOOTH_ALPHA -- the same reading the
+        OS cursor uses.
+
+        Calibration UI uses this to display a live readout so the
+        user can see numbers moving when they look around the screen.
+        """
+        with self._lock:
+            return self._smoothed_gaze_norm
+
+    def latest_face_landmarks(self) -> list[Any]:
+        """Return the latest face-mesh landmark lists (one entry per face).
+
+        Empty list when no face is detected.  The calibration UI's
+        eye-overlay reads this to paint dots on the iris and eye
+        corners; the OS does not consume it.
+        """
+        with self._lock:
+            return list(self._latest_face_landmarks)
+
+    def calibrate_gaze_center(self) -> bool:
+        """Snapshot the current smoothed gaze as the "looking at center" baseline.
+
+        Returns True on success, False if no face is currently
+        detected (in which case the baseline stays as whatever it
+        was before -- the operator can retry).
+
+        This is the one method that mutates the baseline; once set,
+        the baseline persists until close() or a subsequent
+        calibrate_gaze_center() call.  Mouse fallback is automatic
+        whenever the smoothed gaze is unavailable (face missing).
+        """
+        with self._lock:
+            if self._smoothed_gaze_norm is None:
+                return False
+            self._gaze_baseline = self._smoothed_gaze_norm
+        return True
+
+    def has_gaze_calibration(self) -> bool:
+        """Return True if a center-baseline has been captured."""
+        with self._lock:
+            return self._gaze_baseline is not None
+
+    def gaze_cursor(
+        self, canvas_w: int, canvas_h: int,
+    ) -> Optional[tuple[int, int]]:
+        """Return the gaze-driven cursor position in canvas pixels.
+
+        Math (only runs when both a baseline and a current smoothed
+        reading exist):
+            dx_norm = current_x - baseline_x
+            dy_norm = current_y - baseline_y
+            cursor_x = canvas_w / 2 + dx_norm * GAZE_GAIN_X * canvas_w
+            cursor_y = canvas_h / 2 + dy_norm * GAZE_GAIN_Y * canvas_h
+
+        Clamped to canvas bounds so a wild iris reading can't crash
+        the hover hit-test with a negative index.  Returns None
+        without a baseline OR without a current reading, in which
+        case the OS falls back to the mouse cursor (a deliberate
+        gentle-degradation rather than freezing the cursor at the
+        last-known position -- if the camera loses the face for
+        five seconds, mouse takes over).
+        """
+        with self._lock:
+            baseline = self._gaze_baseline
+            current = self._smoothed_gaze_norm
+        if baseline is None or current is None:
+            return None
+        dx_norm = current[0] - baseline[0]
+        dy_norm = current[1] - baseline[1]
+        cursor_x = int(round(
+            canvas_w * 0.5 + dx_norm * GAZE_GAIN_X * canvas_w,
+        ))
+        cursor_y = int(round(
+            canvas_h * 0.5 + dy_norm * GAZE_GAIN_Y * canvas_h,
+        ))
+        cursor_x = max(0, min(canvas_w - 1, cursor_x))
+        cursor_y = max(0, min(canvas_h - 1, cursor_y))
+        return cursor_x, cursor_y
+
+    def latest_camera_frame_bgr(self) -> Optional[np.ndarray]:
+        """Return the most recent (mirrored) camera BGR frame, or None.
+
+        The calibration UI consumes this to show the live camera
+        feed at calibration time.  We return a reference, not a
+        copy -- the camera thread allocates a fresh ndarray every
+        iteration so the OS reader never observes a half-written
+        buffer.  Callers MUST treat the returned array as
+        read-only; mutating it would race with the next frame.
+        """
+        with self._lock:
+            return self._latest_camera_bgr
 
     def step(self, canvas_w: int, canvas_h: int) -> HandFrame:
         """Return the latest HandFrame.  Non-blocking.
@@ -809,6 +1068,14 @@ class HandInput:
             # thread shutting down, swallow the error rather than
             # crash the OS exit path.
             pass
+        # Same defensive close for FaceMesh.  Two models sharing one
+        # process is unusual enough that a clean teardown matters --
+        # leaving a graph open has been observed (on older mediapipe
+        # builds) to delay the next process's camera open by ~1s.
+        try:
+            self._face_mesh.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Background thread -- one loop iteration per camera frame
@@ -858,8 +1125,15 @@ class HandInput:
                 # mirrored user-facing view.
                 frame = cv2.flip(frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = self._hands_model.process(rgb)
-                self._publish_results(frame, results)
+                # Run BOTH models on the same RGB buffer.  Hands first
+                # so the wrist/index data is fresh when the publisher
+                # builds the HandFrame; face mesh second.  Either can
+                # raise (MediaPipe occasionally throws on a degenerate
+                # frame); the outer try in this loop catches that and
+                # skips the publish for one frame.
+                hand_results = self._hands_model.process(rgb)
+                face_results = self._face_mesh.process(rgb)
+                self._publish_results(frame, hand_results, face_results)
             except Exception:
                 # Defensive catch: a single bad frame should not stop
                 # the loop.  We don't print here because the loop is
@@ -869,17 +1143,60 @@ class HandInput:
                 self._stop_event.wait(timeout=0.005)
                 continue
 
-    def _publish_results(self, camera_bgr: np.ndarray, results: Any) -> None:
+    def _publish_results(
+        self,
+        camera_bgr: np.ndarray,
+        results: Any,
+        face_results: Any,
+    ) -> None:
         """Convert MediaPipe results into the latest HandFrame + thumbnail state.
 
         Called once per camera frame from the background thread.
         Acquires the lock once, at the end, to publish the new state.
         All the math runs OUTSIDE the lock so the OS thread is never
         blocked on tracker logic.
+
+        `face_results` is the face-mesh output for the SAME frame.
+        We use it only to update the gaze state -- the HandFrame
+        itself is computed purely from `results` (hands), unchanged.
         """
         canvas_w = self._canvas_w
         canvas_h = self._canvas_h
         hands_list = results.multi_hand_landmarks or []
+
+        # Face mesh: extract iris-in-eye normalised position.  The
+        # value is None when no face is detected; the smoothed value
+        # is held across short detection dropouts so the cursor
+        # doesn't snap to the canvas centre every time the model
+        # blips for one frame.
+        face_list: list[Any] = (
+            face_results.multi_face_landmarks or []
+            if face_results is not None
+            else []
+        )
+        gaze_norm = _compute_gaze_norm(face_list, camera_bgr.shape[1],
+                                       camera_bgr.shape[0])
+        if gaze_norm is not None:
+            prev = self._smoothed_gaze_norm
+            if prev is None:
+                # First reading: seed the EMA with the raw value so
+                # the cursor doesn't ramp from (0,0) for the first
+                # GAZE_SMOOTH_ALPHA-decay window.
+                smoothed = gaze_norm
+            else:
+                smoothed = (
+                    GAZE_SMOOTH_ALPHA * gaze_norm[0]
+                    + (1.0 - GAZE_SMOOTH_ALPHA) * prev[0],
+                    GAZE_SMOOTH_ALPHA * gaze_norm[1]
+                    + (1.0 - GAZE_SMOOTH_ALPHA) * prev[1],
+                )
+            self._latest_gaze_norm = gaze_norm
+            self._smoothed_gaze_norm = smoothed
+        # When no face is detected we KEEP the previous smoothed
+        # reading.  This is the "stale-on-loss" behaviour the user
+        # expects: looking away from the camera for a moment shouldn't
+        # warp the cursor to (0, 0); the cursor just freezes where it
+        # last was until the face comes back.
 
         # Reset edge flags for this iteration.  The publishable
         # HandFrame's drag_just_* fields are TRUE for exactly the
@@ -954,6 +1271,12 @@ class HandInput:
             self._latest_camera_bgr = camera_bgr
             self._latest_landmarks = hands_list
             self._latest_is_pinching = is_pinching_visual
+            # Publish face landmarks so the calibration UI can paint
+            # the iris dots / eye outline on its preview.  We publish
+            # by reference -- mediapipe returns a fresh proto object
+            # per process() call, so the OS thread can't observe a
+            # half-written list.
+            self._latest_face_landmarks = face_list
 
     def _advance_tracker(
         self,

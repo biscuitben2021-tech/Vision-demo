@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from typing import Final, Optional
 
 import cv2
+import numpy as np
 
 from src.compositor import Compositor
 from src.design import draw_fps_hud
@@ -392,6 +393,312 @@ def _try_construct_hand_input(camera_index: Optional[int]):
     return hand_input
 
 
+# ----------------------------------------------------------------------------
+# Eye-tracking calibration screen
+# ----------------------------------------------------------------------------
+#
+# Runs BEFORE the OS opens.  Shows a fullscreen window with:
+#     * the live camera feed in the top-left of the canvas, with iris
+#       dots and eye outlines drawn on top so the user can see what
+#       the system is reading;
+#     * a large crosshair / target dot in the centre of the canvas;
+#     * a short instruction line ("Look at the centre dot, then
+#       press SPACE").
+#
+# When the user presses SPACE we ask HandInput to snapshot the
+# current smoothed gaze as the "looking-at-centre" baseline; in the
+# OS that baseline is the origin point for cursor placement.  ESC
+# bails out without setting a baseline -- the OS still runs, just
+# with the mouse driving the cursor (gaze-cursor returns None until
+# a baseline exists).
+#
+# Why a separate window (not the OS fullscreen window): the OS
+# window is created with the WND_PROP_FULLSCREEN flag which on macOS
+# claims the entire display and locks us out of resizing it.  The
+# calibration screen is a one-shot UI before the OS boots, so it
+# uses a plain WINDOW_NORMAL window we can dismiss cleanly with
+# destroyWindow -- once it's gone, make_fullscreen_window can claim
+# the screen for the OS.
+#
+# This screen is COSMETIC -- nothing OS-critical depends on it.  If
+# the user dismisses with ESC or the face isn't detected, the OS
+# boots regardless and the cursor falls back to the mouse.
+
+_CAL_WINDOW_NAME: Final[str] = "Vision OS -- Eye Calibration"
+_CAL_TARGET_OUTER_R: Final[int] = 26    # the visible "look here" ring
+_CAL_TARGET_INNER_R: Final[int] = 6     # tight dot inside the ring
+_CAL_TARGET_COLOR_BGR: Final[tuple[int, int, int]] = (255, 255, 255)
+_CAL_PREVIEW_W: Final[int] = 480        # camera preview width on the cal canvas
+_CAL_PREVIEW_H: Final[int] = 270        # 16:9 to match the camera aspect
+_CAL_PREVIEW_MARGIN: Final[int] = 32
+_CAL_TEXT_COLOR_BGR: Final[tuple[int, int, int]] = (240, 240, 240)
+_CAL_TEXT_DIM_BGR: Final[tuple[int, int, int]] = (140, 140, 140)
+_CAL_SPACE_KEY: Final[int] = 32
+_CAL_ESC_KEY: Final[int] = 27
+
+# Face-mesh landmark indices we draw on the calibration preview.
+# Mirrors src.hands -- duplicated here so this helper does not need
+# to reach into the hands module for constants.  Iris dots + the
+# four eye-corner / lid points each.
+_CAL_EYE_DRAW_INDICES: Final[tuple[int, ...]] = (
+    468, 473,                      # iris centres (left, right)
+    33, 133, 159, 145,             # left eye outer/inner/top/bottom
+    263, 362, 386, 374,            # right eye outer/inner/top/bottom
+)
+
+
+def _paint_calibration_preview(
+    canvas: np.ndarray,
+    camera_bgr,
+    face_landmarks_list,
+    preview_x: int,
+    preview_y: int,
+) -> None:
+    """Paint the camera-feed preview + iris overlay into a region of the canvas.
+
+    `camera_bgr` is the most recent mirrored frame from the
+    HandInput; `face_landmarks_list` is the corresponding face-mesh
+    output (one entry per detected face).  We resize the camera
+    frame to (preview_w, preview_h) then walk the eye landmarks and
+    drop a coloured dot at each one's pixel position.  When no face
+    is detected we paint the camera frame alone -- the user can see
+    themselves moving, just no overlay, which is the diagnostic
+    cue they need to reposition.
+    """
+    if camera_bgr is None:
+        # First frame before the camera thread has published anything.
+        # Paint a placeholder rect so the layout still reads.
+        cv2.rectangle(
+            canvas,
+            (preview_x, preview_y),
+            (preview_x + _CAL_PREVIEW_W, preview_y + _CAL_PREVIEW_H),
+            (40, 40, 40), -1,
+        )
+        return
+
+    src_h, src_w = camera_bgr.shape[:2]
+    preview = cv2.resize(
+        camera_bgr, (_CAL_PREVIEW_W, _CAL_PREVIEW_H),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    # Iris + eye-corner dots, scaled from camera-frame normalised
+    # coords to preview-frame pixels.  Two colours so the iris reads
+    # distinctly from the eye-corner markers.
+    iris_color = (90, 220, 90)        # green -- iris centre
+    corner_color = (60, 130, 240)     # orange -- eye corners / lids
+    if face_landmarks_list:
+        lms = face_landmarks_list[0].landmark
+        for idx in _CAL_EYE_DRAW_INDICES:
+            x_norm = lms[idx].x
+            y_norm = lms[idx].y
+            px = int(x_norm * _CAL_PREVIEW_W)
+            py = int(y_norm * _CAL_PREVIEW_H)
+            # Clip to preview rect -- a head turn can put a landmark
+            # off the camera frame and we don't want cv2.circle to
+            # crash on a negative index.
+            if 0 <= px < _CAL_PREVIEW_W and 0 <= py < _CAL_PREVIEW_H:
+                colour = iris_color if idx in (468, 473) else corner_color
+                cv2.circle(preview, (px, py), 3, colour, -1)
+
+    # Paste the preview into the calibration canvas.
+    canvas[
+        preview_y:preview_y + _CAL_PREVIEW_H,
+        preview_x:preview_x + _CAL_PREVIEW_W,
+    ] = preview
+    # 1px border around the preview.  Same diagnostic visual the
+    # OS-time thumbnail uses, repeated here for consistency.
+    cv2.rectangle(
+        canvas,
+        (preview_x - 1, preview_y - 1),
+        (preview_x + _CAL_PREVIEW_W, preview_y + _CAL_PREVIEW_H),
+        (255, 255, 255), 1,
+    )
+
+
+def _paint_calibration_target(
+    canvas: np.ndarray, cx: int, cy: int,
+) -> None:
+    """Draw a centred crosshair + ring at (cx, cy) on the calibration canvas.
+
+    Two concentric circles: a large hollow ring at _CAL_TARGET_OUTER_R
+    and a solid dot at _CAL_TARGET_INNER_R.  The ring gives the eye
+    something to fixate on; the inner dot is the actual aim point.
+    Plus a 1px crosshair so a user with shaky tracking can verify
+    they're centred on the dot rather than just "near the ring".
+    """
+    cv2.circle(canvas, (cx, cy), _CAL_TARGET_OUTER_R,
+               _CAL_TARGET_COLOR_BGR, 2, cv2.LINE_AA)
+    cv2.circle(canvas, (cx, cy), _CAL_TARGET_INNER_R,
+               _CAL_TARGET_COLOR_BGR, -1, cv2.LINE_AA)
+    # Crosshair lines extending slightly past the ring.
+    span = _CAL_TARGET_OUTER_R + 18
+    cv2.line(canvas, (cx - span, cy), (cx + span, cy),
+             (90, 90, 90), 1, cv2.LINE_AA)
+    cv2.line(canvas, (cx, cy - span), (cx, cy + span),
+             (90, 90, 90), 1, cv2.LINE_AA)
+
+
+def _paint_calibration_text(
+    canvas: np.ndarray, has_face: bool, gaze_norm,
+) -> None:
+    """Two-line instruction at the bottom of the calibration canvas.
+
+    Line 1: the main instruction ("Look at the centre dot, then
+    press SPACE").  White, large.
+    Line 2: a live readout that flips between two states:
+        * "Searching for your face..."  when no face is detected
+        * "Gaze x=0.50 y=0.50"           when a face is being tracked
+    The readout gives the user instant confirmation the camera is
+    seeing them; if they press SPACE before the readout shows
+    numbers, the calibration silently fails and the OS boots without
+    a baseline.
+    """
+    canvas_h, canvas_w = canvas.shape[:2]
+    title = "Look at the centre dot, then press SPACE."
+    subtitle_y = canvas_h - 50
+    title_y = canvas_h - 80
+    (tw, th), _ = cv2.getTextSize(
+        title, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 1,
+    )
+    cv2.putText(
+        canvas, title,
+        ((canvas_w - tw) // 2, title_y),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, _CAL_TEXT_COLOR_BGR, 1, cv2.LINE_AA,
+    )
+
+    if has_face and gaze_norm is not None:
+        sub = f"Gaze  x={gaze_norm[0]:.2f}  y={gaze_norm[1]:.2f}"
+        sub_color = _CAL_TEXT_DIM_BGR
+    elif has_face:
+        sub = "Face detected -- hold still"
+        sub_color = _CAL_TEXT_DIM_BGR
+    else:
+        sub = "Searching for your face..."
+        sub_color = _CAL_TEXT_DIM_BGR
+    (sw, sh), _ = cv2.getTextSize(
+        sub, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1,
+    )
+    cv2.putText(
+        canvas, sub,
+        ((canvas_w - sw) // 2, subtitle_y),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, sub_color, 1, cv2.LINE_AA,
+    )
+
+    hint = "ESC to skip (mouse-driven cursor)"
+    (hw, _hh), _ = cv2.getTextSize(
+        hint, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1,
+    )
+    cv2.putText(
+        canvas, hint,
+        ((canvas_w - hw) // 2, canvas_h - 22),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (110, 110, 110), 1, cv2.LINE_AA,
+    )
+
+
+def _run_eye_calibration(hand_input) -> bool:
+    """Show the calibration screen until SPACE captures a baseline or ESC bails.
+
+    Returns True on a successful capture (the user pressed SPACE
+    while a face was detected and the smoothed-gaze reading was
+    available), False on ESC / quit / window-close.  In either
+    outcome the calibration window is destroyed before this returns.
+
+    `hand_input` must already be running -- this function does not
+    construct it.  We poll its public surface to get the latest
+    camera frame, face landmarks, and gaze reading; the heavy
+    lifting (the MediaPipe inference, the EMA) is happening on the
+    HandInput's background thread and we just visualise it here.
+    """
+    # Best-effort window sizing: ask cv2 for the screen rect at the
+    # window-creation moment; fall back to a sensible 1280x720 if
+    # cv2 can't tell us yet (rare, but possible on macOS during the
+    # first second after the cv2 binding loads).
+    cv2.namedWindow(_CAL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    rect = cv2.getWindowImageRect(_CAL_WINDOW_NAME) or (0, 0, 1280, 720)
+    _x, _y, cal_w, cal_h = rect
+    if cal_w <= 0 or cal_h <= 0:
+        cal_w, cal_h = 1280, 720
+    cv2.resizeWindow(_CAL_WINDOW_NAME, cal_w, cal_h)
+
+    captured = False
+    print(
+        "[phase8] Calibration: look at the centre dot, "
+        "press SPACE to capture, or ESC to skip."
+    )
+
+    # Loop until the user commits.  The window is windowed (not
+    # fullscreen) so the operator can still see and interact with
+    # the terminal -- helpful during debugging.
+    while True:
+        # Each iteration: rebuild a fresh black canvas at the latest
+        # window dimensions, paint the preview + target + text,
+        # then imshow.  Polling the canvas size each frame handles
+        # the case where the user resizes the window.
+        rect = cv2.getWindowImageRect(_CAL_WINDOW_NAME)
+        if rect:
+            _x, _y, cal_w, cal_h = rect
+            if cal_w <= 0 or cal_h <= 0:
+                cal_w, cal_h = 1280, 720
+        canvas = np.zeros((cal_h, cal_w, 3), dtype=np.uint8)
+
+        camera_bgr = hand_input.latest_camera_frame_bgr()
+        face_landmarks_list = hand_input.latest_face_landmarks()
+        gaze_norm = hand_input.latest_gaze_norm()
+
+        # Preview anchored top-left at a comfortable inset.
+        _paint_calibration_preview(
+            canvas, camera_bgr, face_landmarks_list,
+            preview_x=_CAL_PREVIEW_MARGIN,
+            preview_y=_CAL_PREVIEW_MARGIN,
+        )
+        _paint_calibration_target(canvas, cal_w // 2, cal_h // 2)
+        _paint_calibration_text(
+            canvas, bool(face_landmarks_list), gaze_norm,
+        )
+
+        cv2.imshow(_CAL_WINDOW_NAME, canvas)
+        key = cv2.waitKey(15) & 0xFF
+        if key == _CAL_SPACE_KEY:
+            captured = hand_input.calibrate_gaze_center()
+            if captured:
+                break
+            # SPACE with no face / gaze -- print a hint and keep
+            # looping so the user can move their face into view and
+            # retry without restarting the program.
+            print(
+                "[phase8] No face detected yet -- centre your face "
+                "in the preview and try SPACE again."
+            )
+            continue
+        if key in (_CAL_ESC_KEY, ord("q"), ord("Q")):
+            break
+
+        # User dismissed the window via the OS close button.
+        try:
+            visible = cv2.getWindowProperty(
+                _CAL_WINDOW_NAME, cv2.WND_PROP_VISIBLE,
+            )
+        except cv2.error:
+            visible = 0.0
+        if visible < 1.0:
+            break
+
+    cv2.destroyWindow(_CAL_WINDOW_NAME)
+    # waitKey calls give cv2 the cycles it needs to actually tear
+    # the window down on macOS; without this the OS fullscreen
+    # window opens INSIDE the calibration window's leftover frame.
+    for _ in range(3):
+        cv2.waitKey(1)
+    if captured:
+        print("[phase8] Centre gaze captured.  Cursor will track your eyes.")
+    else:
+        print(
+            "[phase8] Calibration skipped -- cursor will follow the mouse."
+        )
+    return captured
+
+
 def main() -> None:
     """Run the Phase 8 fullscreen loop until ESC, Q, or window close.
 
@@ -425,6 +732,27 @@ def main() -> None:
     # available cameras and reads the operator's pick.
     chosen_camera = _resolve_camera_index(args.camera)
 
+    # Bring up the HandInput BEFORE the fullscreen window so the
+    # calibration screen can run in a normal window without fighting
+    # the OS fullscreen claim.  Order matters: the camera + face
+    # mesh start running here, the calibration screen visualises
+    # them, then the fullscreen OS window opens.
+    if chosen_camera is None:
+        hand_input = None
+    else:
+        hand_input = _try_construct_hand_input(chosen_camera)
+
+    # Calibration screen.  Only shown when hand input is actually
+    # online (no point asking the user to look at a dot if we can't
+    # read their gaze).  Returns False on ESC / quit / no-face --
+    # in either case the OS still boots, just with the mouse driving
+    # the cursor.  We give the camera a moment to warm up so the
+    # first calibration frame has a real face reading rather than a
+    # cold-start blank.
+    if hand_input is not None:
+        time.sleep(0.4)
+        _run_eye_calibration(hand_input)
+
     make_fullscreen_window(WINDOW_NAME)
 
     # Reduced-motion detection.  Combines the argparse-parsed flag
@@ -444,18 +772,6 @@ def main() -> None:
     ctx = _MainLoopContext()
     cv2.setMouseCallback(WINDOW_NAME, _mouse_callback, ctx)
 
-    # Hand input bring-up.  None on failure; the rest of the loop
-    # treats hand_input is None as "no thumbnail, no pinch click,
-    # no page swipe" and the OS still runs in mouse-only mode.
-    # `chosen_camera` is either the operator's pick (from --camera or
-    # the interactive prompt) or None if the probe found nothing -- in
-    # which case _try_construct_hand_input will also return None and
-    # the OS boots mouse-only.
-    if chosen_camera is None:
-        hand_input = None
-    else:
-        hand_input = _try_construct_hand_input(chosen_camera)
-
     # Time baseline -- cv2 tick clock, the same one phase5's
     # now_ms_relative reads.  Compositor expects now_ms relative to
     # this baseline.
@@ -473,9 +789,7 @@ def main() -> None:
             _fire_due_notifications(compositor, ctx, now_ms)
 
             # Consume the mouse click and the cached cursor xy in the
-            # same step Phase 7 uses.  The cursor reading stays the
-            # mouse position -- Phase 8 deliberately does NOT route
-            # the hand cursor into here.
+            # same step Phase 7 uses.
             mouse_pressed = ctx.pending_click
             ctx.pending_click = False
             mouse_xy = ctx.mouse_xy
@@ -495,6 +809,19 @@ def main() -> None:
                 hand_frame = hand_input.step(canvas_w, canvas_h)
             else:
                 hand_frame = _no_hand_frame()
+
+            # Cursor source: gaze when the calibration captured a
+            # baseline AND the face is currently being tracked;
+            # otherwise mouse.  hand_input.gaze_cursor() encapsulates
+            # both gates -- it returns None when either condition
+            # fails -- so the choice here is a single conditional.
+            # This is the load-bearing eye-control behaviour: the
+            # user's gaze IS the cursor, and the mouse becomes the
+            # fallback for when the camera loses the face.
+            if hand_input is not None:
+                gaze_xy = hand_input.gaze_cursor(canvas_w, canvas_h)
+                if gaze_xy is not None:
+                    mouse_xy = gaze_xy
 
             # Page-drag dispatch.  Only meaningful on the home screen
             # -- drags that start inside an app are silently absorbed
