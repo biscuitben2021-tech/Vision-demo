@@ -33,4 +33,9 @@
 opencv-python>=4.10,<5
 numpy>=1.26,<3
 Pillow>=10.0,<12
-mediapipe>=0.10,<0.12
+# Pinned to 0.10.14 because mediapipe >= 0.10.30ish removed the legacy
+# `mp.solutions.hands` / `mp.solutions.face_mesh` API in favour of the
+# new `mp.tasks` API.  `src/hands.py` uses the legacy API, so we hold
+# the line at the last release that still ships it.  Same pin the
+# Hand-controller reference project uses.
+mediapipe==0.10.14
