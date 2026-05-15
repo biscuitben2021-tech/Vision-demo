@@ -1,4 +1,4 @@
-# Phase 1 dependencies for the Vision OS demo.
+# Dependencies for the Vision OS demo.
 #
 # Why these versions:
 #   opencv-python >= 4.10   -- needed for cv2.getWindowImageRect on macOS
@@ -11,11 +11,26 @@
 #   Pillow       >= 10.0    -- font.set_variation_by_name landed in 9.5;
 #                              10+ gives us the modern getbbox/getlength
 #                              text-metrics API we rely on for layout.
+#   mediapipe    >= 0.10    -- Phase 8 adds optional MediaPipe Hands.  If
+#                              mediapipe is not installed the demo still
+#                              runs in mouse-only mode (phase8_hand.py
+#                              catches the import / camera failure and
+#                              falls back), so this stays installable as
+#                              an optional add-on from a runtime
+#                              perspective; we pin a version known to work
+#                              with the rest of the stack.  The 0.10+
+#                              wheels on Apple Silicon Pythons support
+#                              both numpy 1.x and 2.x at recent versions,
+#                              so the numpy upper bound above stays open.
 #
-# We deliberately do NOT add MediaPipe, scikit-learn, or any tracker
-# library here.  Part 1 (the OS) renders with cv2 + numpy + PIL only.
-# Trackers come in Phase 8+ when we clone this folder.
+# We deliberately do NOT add scikit-learn, PyTorch, or pyautogui:
+#   - scikit-learn comes back when the eye-tracking Part 2 phases land.
+#   - PyTorch lives only behind the optional Phase 12 `--pretrained` flag.
+#   - pyautogui is not needed.  Phase 8 keeps every gesture INSIDE the
+#     fake OS canvas; we never drive the real macOS mouse, so the
+#     cross-platform mouse-control story can be deferred indefinitely.
 
 opencv-python>=4.10,<5
 numpy>=1.26,<3
 Pillow>=10.0,<12
+mediapipe>=0.10,<0.12

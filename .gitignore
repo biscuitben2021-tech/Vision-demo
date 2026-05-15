@@ -1,5 +1,94 @@
-venv/
+# =============================================================================
+# Vision OS demo -- .gitignore
+# =============================================================================
+# Everything below is excluded from git.  The goal: nothing that isn't
+# source code, docs, or build metadata should land in a public repo.
+
+# -----------------------------------------------------------------------------
+# Python build artefacts
+# -----------------------------------------------------------------------------
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# -----------------------------------------------------------------------------
+# Virtual environments (any name, any depth)
+# -----------------------------------------------------------------------------
+venv/
+.venv/
+env/
+.env/
+**/venv/
+**/.venv/
+
+# -----------------------------------------------------------------------------
+# OS / editor junk
+# -----------------------------------------------------------------------------
 .DS_Store
+**/.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# -----------------------------------------------------------------------------
+# Personal / private data that lives in adjacent project folders
+# -----------------------------------------------------------------------------
+# Calibration pickles encode personal gaze patterns and webcam snapshots
+# of the user's face.  Never publish these.
 *.pkl
+calibration.pkl
+guest_calibration.pkl
+
+# Webcam-probe debug snapshots written by the eye-tracking prototype.
+camera_*_snapshot.jpg
+camera_*_snapshot.jpeg
+camera_*_snapshot.png
+
+# MediaPipe / model binaries (large + redownloadable).
+*.task
+*.tflite
+*.onnx
+models/
+**/models/
+
+# -----------------------------------------------------------------------------
+# Sidecar project folders -- contain their own venvs + personal data
+# -----------------------------------------------------------------------------
+# These three folders are reference implementations bundled locally
+# during development.  They contain .venv directories, __pycache__,
+# personal camera snapshots, and the user's prior eye-tracking
+# calibration.  Excluded wholesale; the parts of them that matter
+# (the gesture math, the gaze model) have already been ported into
+# src/ in this repo.
+Eye movement pointer copy/
+Hand controller copy/
+Hand controller copy final/
+
+# -----------------------------------------------------------------------------
+# Secrets, env files, credentials -- defensive, none expected
+# -----------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets.json
+credentials.json
+**/.netrc
+
+# -----------------------------------------------------------------------------
+# Recording / output artefacts
+# -----------------------------------------------------------------------------
+*.mp4
+*.mov
+*.avi
+recordings/
+captures/

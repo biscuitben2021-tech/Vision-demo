@@ -293,6 +293,54 @@ class TransitionState:
     duration_ms: int = TRANSITION_DURATION_MS
 
 
+@dataclass
+class PageSnapState:
+    """In-flight rubber-band / commit animation between two home pages.
+
+    The compositor records one of these when `end_page_drag` runs;
+    `_advance_page_snap_if_done` advances `drag_offset_px` along the
+    eased curve every frame and clears the snap when done.
+
+    Fields:
+        from_offset_px: the `drag_offset_px` value at the moment the
+                        user released the drag.  Used as the lerp's
+                        starting point so the snap continues smoothly
+                        from wherever the hand let go, with no jump.
+        to_offset_px:   the target `drag_offset_px` at the end of the
+                        snap.  Either 0.0 (rubber-band back to the
+                        current page) or +/- canvas_w (commit to the
+                        right or left neighbour respectively).
+        start_ms:       wall-clock millisecond at which the snap began.
+        duration_ms:    snap length, defaults to PAGE_SNAP_DURATION_MS.
+        target_page:    page index to become `current_page` when the
+                        snap completes.  When rubber-banding back, this
+                        is the same as the current page; on commit it
+                        is the neighbour.
+
+    Lifecycle:
+        elapsed in [0, duration_ms]   -- drag_offset_px lerps eased.
+        elapsed >= duration_ms        -- compositor.current_page :=
+                                         target_page, drag_offset_px
+                                         := 0, page_snap cleared.
+
+    `target_page` is the source of truth that survives the snap.  When
+    the snap completes we replace the offset with 0 AND set
+    current_page to the page that has been "rolled into the viewport"
+    -- if we'd been snapping toward a neighbour, the offset at snap
+    end is +/- canvas_w which corresponds visually to the neighbour
+    sitting where the current page used to be; resetting offset to 0
+    AND swapping current_page is the same final picture as keeping
+    offset = +/- canvas_w would be, but it puts the offset back in
+    the [0, canvas_w] mathematical neighbourhood the dragger expects.
+    """
+
+    from_offset_px: float
+    to_offset_px: float
+    start_ms: int
+    target_page: int
+    duration_ms: int = PAGE_SNAP_DURATION_MS
+
+
 # ============================================================================
 # Compositor -- the OS state container + per-frame painter
 # ============================================================================
@@ -383,6 +431,54 @@ class Compositor:
         self.geometry: Optional[GridGeometry] = None
         self.motion: MotionState = build_motion_state(reduced_motion=reduced_motion)
 
+        # ------------------------------------------------------------------
+        # Multi-page home state (Phase 8)
+        # ------------------------------------------------------------------
+        #
+        # `pages` is the canonical home-screen roster, indexed by page
+        # number.  Page 0 is the original APPS list (so callers that
+        # only know about a single home page see the same behaviour
+        # as Phase 7); page 1 is APPS_PAGE_2.  Adding more pages is a
+        # one-line append.
+        #
+        # `current_page` is the page that "fills the viewport" when
+        # drag_offset_px is 0 -- i.e. the resting home page.  It
+        # changes only when a page snap commits to a neighbour.
+        #
+        # `drag_offset_px` is the in-flight horizontal offset applied
+        # to the current page's tiles, in canvas pixels.  Positive
+        # values shift the current page RIGHT (previous neighbour
+        # becomes visible from the left); negative values shift LEFT
+        # (next neighbour from the right).  Stored as a float for
+        # smooth eased interpolation during snaps; rounded to int at
+        # paint time.
+        #
+        # `_drag_active` is True between begin_page_drag and
+        # end_page_drag.  Used to gate click handling: a click that
+        # arrives during a drag is absorbed silently because the hand
+        # is mid-swipe, not committed to a target tile.
+        #
+        # `page_snap` records the in-flight rubber-band / commit
+        # animation when one is running.  None when the home is at
+        # rest.
+        #
+        # `_page_fade_states` is a per-page list of FadeUpStates.
+        # Page 0's entries are the same eight staggered FadeUpStates
+        # `motion.fade_states` holds (we re-use the same instances so
+        # the original Phase 7 animation timing is preserved).  Page
+        # 1+ entries are pre-completed -- start_ms backdated far
+        # enough that .value() returns (1.0, 0.0) on the first read.
+        # The swipe IS the page-2 entry animation; a fresh fade-up
+        # would compete with the user's drag and look broken.
+        self.pages: list[list[tuple[str, str]]] = [APPS, APPS_PAGE_2]
+        self.current_page: int = 0
+        self.drag_offset_px: float = 0.0
+        self._drag_active: bool = False
+        self.page_snap: Optional[PageSnapState] = None
+        self._page_fade_states: list[list[_FadeUpState]] = (
+            self._build_page_fade_states()
+        )
+
         # Font cache for the notification card text.  Loading PIL
         # truetype fonts is not free; we lazy-load on first use the
         # same way src/tiles.py does, so importing this module stays
@@ -413,6 +509,200 @@ class Compositor:
             title=title, body=body, spawn_ms=now_ms,
         ))
 
+    # ------------------------------------------------------------------
+    # Public surface -- multi-page home drag/snap (Phase 8)
+    # ------------------------------------------------------------------
+    #
+    # Three calls form the per-gesture protocol the OS uses:
+    #
+    #     begin_page_drag(now_ms)   -- exactly once when the hand
+    #                                  enters its drag-from-pinch state
+    #                                  on the home screen.
+    #     update_page_drag(dx)      -- every subsequent frame while
+    #                                  the hand is dragging; dx is the
+    #                                  CUMULATIVE displacement in canvas
+    #                                  pixels since drag start, NOT a
+    #                                  per-frame delta.  Using cumulative
+    #                                  matches the input the hand
+    #                                  tracker provides and avoids
+    #                                  rounding-drift accumulation if
+    #                                  the OS misses a frame.
+    #     end_page_drag(now_ms)     -- exactly once when the hand
+    #                                  releases (drag_just_ended).
+    #
+    # The OS calls these only when state == "home"; the methods'
+    # internal guards absorb out-of-state calls so an in-flight
+    # transition can't be hijacked by a stale gesture.  begin_ followed
+    # by update_ without an end_ is a programming error caught by the
+    # guards on subsequent begin_ calls.
+
+    def begin_page_drag(self, now_ms: int) -> None:
+        """Start a fresh page-drag gesture.  No-op if state != home.
+
+        Cancels any in-flight page snap (rare but possible if the user
+        starts a new gesture before the snap animation has finished)
+        and resets the offset to 0.  We do NOT preserve the snap's
+        in-progress offset as a new drag-start position because the
+        gesture-tracking math expects dx to be 0 at the moment the
+        drag begins; mixing the two would require the OS to know about
+        the in-flight snap and stitch the dx offset across the join,
+        which would be a leak of internal state.
+        """
+        if self.state != "home":
+            return
+        self._drag_active = True
+        self.drag_offset_px = 0.0
+        self.page_snap = None
+
+    def update_page_drag(self, dx: int) -> None:
+        """Update the in-flight page-drag offset.  No-op if no drag is active.
+
+        `dx` is the CUMULATIVE horizontal displacement in canvas pixels
+        since `begin_page_drag` was called -- not a per-frame delta.
+        Cumulative matches the HandInput contract and means a missed
+        OS frame doesn't lose dx; the next frame's update arrives with
+        the full integrated value.
+
+        We do not clamp `drag_offset_px` against canvas_w here because
+        the renderer's bounds-clipping handles any over-drag visually
+        (the neighbour page slides further than its natural extent but
+        is silently clipped at the canvas edge) and the snap-threshold
+        check in end_page_drag uses |offset| > 0.25 * canvas_w so a
+        further drag stays a commit-to-neighbour signal.
+        """
+        if not self._drag_active:
+            return
+        self.drag_offset_px = float(dx)
+
+    def end_page_drag(self, now_ms: int) -> None:
+        """Conclude a page-drag gesture and schedule a snap animation.
+
+        Snap target depends on the offset's magnitude:
+            |offset| <= 0.25 * canvas_w -- rubber-band back to current
+                                           page; target_offset = 0;
+                                           target_page = current_page.
+            offset   <  -0.25 * canvas_w -- commit to NEXT page
+                                            (current_page + 1); the
+                                            drag has revealed the
+                                            right neighbour.
+            offset   >   0.25 * canvas_w -- commit to PREVIOUS page
+                                            (current_page - 1); the
+                                            drag has revealed the
+                                            left neighbour.
+        Boundary pages (no neighbour to commit to) silently rubber-band
+        back; the user's swipe past the first or last page reads as a
+        soft bounce, the same way iPadOS handles it.
+
+        No-op if no drag is active.  The OS gates this on
+        `drag_just_ended` so duplicate end_ calls cannot happen, but
+        the guard keeps the method safe to call directly from tests
+        or future programmatic exits.
+        """
+        if not self._drag_active:
+            return
+        self._drag_active = False
+
+        # Determine the snap target based on the offset's sign and
+        # magnitude, then clamp to a valid page index.  Boundary pages
+        # always rubber-band back to themselves.
+        assert self.geometry is not None
+        canvas_w = self.geometry.canvas_w
+        threshold = canvas_w * PAGE_SWIPE_THRESHOLD_FRACTION
+
+        if self.drag_offset_px < -threshold and self.current_page + 1 < len(self.pages):
+            target_page = self.current_page + 1
+            to_offset = -float(canvas_w)
+        elif self.drag_offset_px > threshold and self.current_page - 1 >= 0:
+            target_page = self.current_page - 1
+            to_offset = float(canvas_w)
+        else:
+            target_page = self.current_page
+            to_offset = 0.0
+
+        # Reduced-motion collapses the snap to a hard cut -- one frame
+        # of duration_ms=0 lands the snap at the target on the very
+        # next _advance_page_snap_if_done call.  Same convention the
+        # cross-fade transition uses for the reduced-motion case.
+        duration = 0 if self.reduced_motion else PAGE_SNAP_DURATION_MS
+        self.page_snap = PageSnapState(
+            from_offset_px=self.drag_offset_px,
+            to_offset_px=to_offset,
+            start_ms=now_ms,
+            duration_ms=duration,
+            target_page=target_page,
+        )
+
+    # ------------------------------------------------------------------
+    # Private helpers -- multi-page state
+    # ------------------------------------------------------------------
+
+    def _build_page_fade_states(self) -> list[list[_FadeUpState]]:
+        """Build per-page FadeUpState lists; page 0 staggered, page 1+ instant.
+
+        Page 0 reuses the SAME FadeUpState instances `motion.fade_states`
+        holds.  Sharing the references (rather than copying) means a
+        future motion-state mutation propagates here and vice-versa,
+        which keeps the entry animation consistent between the
+        single-page paint path (paint_grid_with_motion) and the
+        multi-page paint path (the new _render_home_page helper below).
+
+        Page 1+ entries are pre-completed: start_ms backdated by
+        (FADE_UP_DURATION_MS + 1) so the FadeUpState.value() short
+        circuits to (1.0, 0.0) on the first read.  This is the same
+        trick build_motion_state uses for reduced motion.
+        """
+        # Import inline to avoid circular import via src.motion at
+        # module level (we already import _FadeUpState above, but the
+        # constant lives in src.design which is already imported).
+        from src.design import FADE_UP_DURATION_MS
+
+        # Page 0 = the existing staggered states.  Reusing references
+        # keeps the original Phase 5 staggered entry visible on page 0.
+        page0 = self.motion.fade_states
+
+        pages: list[list[_FadeUpState]] = [page0]
+        # Build pre-completed states for every additional page.  One
+        # FadeUpState per tile slot, all with start_ms in the past.
+        # self.pages was set immediately before this call (see __init__);
+        # we read its length to size the per-page fade-state list.
+        for _ in range(1, len(self.pages)):
+            instant: list[_FadeUpState] = [
+                _FadeUpState(start_ms=-FADE_UP_DURATION_MS - 1)
+                for _ in range(len(APPS))
+            ]
+            pages.append(instant)
+        return pages
+
+    def _advance_page_snap_if_done(self, now_ms: int) -> None:
+        """Step the in-flight page snap one frame; finalise if elapsed >= duration.
+
+        Two outcomes per call:
+            1. Snap still in flight -- compute eased t, lerp
+               drag_offset_px from from_offset_px to to_offset_px.
+            2. elapsed >= duration -- commit current_page :=
+               target_page, drag_offset_px := 0, clear the snap.
+               Setting offset to 0 (not to_offset_px) is the key step:
+               the visual position of "neighbour at offset = -canvas_w"
+               is identical to "neighbour-is-now-current with offset
+               = 0", and the latter keeps offset in a sensible range
+               for the next gesture.
+        """
+        snap = self.page_snap
+        if snap is None:
+            return
+        elapsed = now_ms - snap.start_ms
+        if snap.duration_ms <= 0 or elapsed >= snap.duration_ms:
+            self.current_page = snap.target_page
+            self.drag_offset_px = 0.0
+            self.page_snap = None
+            return
+        t = elapsed / float(snap.duration_ms)
+        eased = ease_emphasized(max(0.0, min(1.0, t)))
+        self.drag_offset_px = (
+            snap.from_offset_px
+            + (snap.to_offset_px - snap.from_offset_px) * eased
+        )
+
     def compose_frame(
         self,
         now_ms: int,
@@ -431,6 +721,17 @@ class Compositor:
         """
         self._ensure_geometry(canvas_w, canvas_h)
         self._advance_transition_if_done(now_ms)
+        # Page-snap advancement.  Snaps only run while state ==
+        # "home" -- if we advanced them during a transition, the
+        # home scene rendered into the FROM buffer of a cross-fade
+        # would visibly slide partway between pages while the fade
+        # plays.  Gating on state keeps the cross-fade visually
+        # crisp; in practice _handle_click absorbs clicks during a
+        # snap so the snap-then-transition path is unreachable
+        # anyway, but the guard is the defensive belt-and-braces
+        # version of that invariant.
+        if self.state == "home":
+            self._advance_page_snap_if_done(now_ms)
 
         # Click handling happens BEFORE the hover update so that a
         # click-on-tile starts the transition with the correct app id
@@ -446,11 +747,21 @@ class Compositor:
         # the post-close return-to-home visual clean: no spurious
         # hover bumps from cursor positions we accumulated while the
         # cursor was over an app.
+        #
+        # Multi-page (Phase 8): hit-test against the CURRENT page's
+        # shifted rects, and use a PAGE-AWARE tile id so the hover
+        # state doesn't bleed across pages (a hovered slot 0 on page
+        # 0 must not pull slot 0 on page 1 into a hover scale).
         if self.state == "home":
             assert self.geometry is not None
             mx, my = mouse_xy
-            tile_id = closest_tile(mx, my, self.geometry.tile_rects)
-            self.motion.hover_state.set_hover(tile_id, now_ms)
+            shifted_rects = self._current_page_shifted_rects()
+            tile_idx = closest_tile(mx, my, shifted_rects)
+            page_aware_id = (
+                self.current_page * len(APPS) + tile_idx
+                if tile_idx is not None else None
+            )
+            self.motion.hover_state.set_hover(page_aware_id, now_ms)
 
         # Compose the actual frame.  Three top-level cases driven by
         # the current state; each delegates to a sibling helper.
@@ -532,16 +843,18 @@ class Compositor:
     def _handle_click(self, now_ms: int, mouse_xy: tuple[int, int]) -> None:
         """Translate a one-shot click into either a transition start or a no-op.
 
-        Three cases:
-            1. state == "home" and click is on a tile rect -- start a
-               home -> app transition aimed at that tile's app id.
-            2. state == "app" and click is on the close-button rect --
+        Four cases:
+            1. state == "home", click on a tile rect, no drag / snap in
+               flight -- start a home -> app transition aimed at that
+               tile's app id (resolved against the CURRENT page).
+            2. state == "home" but a page drag is active OR a page
+               snap is in flight -- absorb the click silently.  The
+               user is mid-swipe; opening an app mid-gesture would
+               feel like an accidental tap.
+            3. state == "app" and click is on the close-button rect --
                start an app -> home transition.
-            3. state == "transitioning" -- absorb the click silently.
-               Queuing clicks during transitions is the kind of "buffer
-               your intent" UX feature that helps prosumer apps but
-               distracts in a stage demo, where unintended re-opens
-               break the choreography.
+            4. state == "transitioning" -- absorb the click silently
+               (same rationale as Phase 7).
         """
         if self.state == "transitioning":
             return
@@ -549,11 +862,30 @@ class Compositor:
         mx, my = mouse_xy
 
         if self.state == "home":
-            assert self.geometry is not None
-            tile_id = closest_tile(mx, my, self.geometry.tile_rects)
-            if tile_id is None:
+            # Mid-swipe absorbtion.  Either an active drag (the hand
+            # is still pinched and pulling the page across) or an
+            # in-flight snap (the user just released but the page
+            # hasn't landed yet) suppresses click handling.  Once the
+            # page settles, the snap clears and clicks fire normally.
+            if self._drag_active or self.page_snap is not None:
                 return
-            app_id, _display_name = APPS[tile_id]
+
+            assert self.geometry is not None
+            # Hit-test against the SHIFTED current-page rects.  At
+            # rest (drag_offset_px == 0) the shifted rects are
+            # identical to geometry.tile_rects, so behaviour matches
+            # Phase 7 exactly.  When mid-snap is allowed in the
+            # future (we currently absorb), the shift would carry the
+            # user's eye-to-cursor mapping cleanly.
+            shifted_rects = self._current_page_shifted_rects()
+            tile_idx = closest_tile(mx, my, shifted_rects)
+            if tile_idx is None:
+                return
+            # Resolve the app id from the CURRENT page's roster --
+            # not the global APPS list -- so page 2's clicks open
+            # page 2's apps (which happen to be the same eight ids
+            # in a different order in Phase 8).
+            app_id, _display_name = self.pages[self.current_page][tile_idx]
             self._start_transition(
                 from_screen="home", to_screen="app",
                 to_app_id=app_id, from_app_id=None, now_ms=now_ms,
@@ -635,6 +967,14 @@ class Compositor:
     ) -> None:
         """Paint the 4x2 grid + label band into `frame`, no chrome.
 
+        Multi-page (Phase 8): renders the CURRENT page at its drag
+        offset.  When the offset is non-zero, ALSO renders the
+        adjacent neighbour that is being revealed -- the page on the
+        right when the offset is negative (hand pulled left), on the
+        left when the offset is positive.  At rest (offset = 0) only
+        the current page is drawn, which is identical to the Phase 7
+        single-page render.
+
         Hover scale is applied via the compositor's MotionState exactly
         as Phase 5 does -- but only when the live state is "home", which
         the caller (compose_frame) gates by NOT calling set_hover during
@@ -645,26 +985,115 @@ class Compositor:
         the cursor moves over the half-faded home tile during the
         transition and the hover bumps gently decay away rather than
         snapping.
-
-        Note that `w` and `h` are part of the signature for symmetry
-        with `_render_app` even though `paint_grid_with_motion` reads
-        the geometry off `self.geometry` rather than the function args.
-        Keeping the signature uniform is a small price for callers
-        that dispatch by string ("render this side") rather than by
-        type.
         """
         assert self.geometry is not None
-        # Paint the warm-aurora wallpaper as the first layer so the
-        # glass panels above it have varied content to refract through.
-        # The aurora is cached per resolution -- per-frame cost is just
-        # a single np.copyto.  Without this layer the underlying
-        # wallpaper is BG_DARK (#000) and the Liquid Glass effect
-        # becomes nearly invisible: blurring black yields black, and
-        # the frost tint reads as a flat darker rectangle.
+        # Warm-aurora wallpaper first.  Without this layer the
+        # underlying wallpaper is BG_DARK (#000) and the Liquid Glass
+        # tiles atop have nothing to refract through.  Painted once,
+        # ACROSS the whole canvas, regardless of page count -- pages
+        # don't have separate wallpapers (a future Phase could, but
+        # the Vision Pro home pages all share one environment).
         paint_warm_aurora(frame, w, h)
-        paint_grid_with_motion(
-            frame, self.geometry, self.motion, self._label_font, now_ms,
+
+        offset_int = int(round(self.drag_offset_px))
+        # Render the current page at its drag offset.  When offset is
+        # 0 this paints in the same spot as Phase 7's single-page
+        # render, so the visual at rest is identical.
+        self._render_home_page(
+            frame, self.current_page, x_offset=offset_int, now_ms=now_ms,
         )
+        # Render the neighbour that is becoming visible, if any.  A
+        # negative drag offset (hand pulled left) reveals the page on
+        # the RIGHT (current_page + 1); a positive offset reveals the
+        # page on the LEFT (current_page - 1).  The neighbour is
+        # drawn at `offset +/- canvas_w` so its left edge meets the
+        # current page's right edge (or vice versa).  Out-of-range
+        # neighbours (the first or last page being dragged past their
+        # boundary) are silently skipped, which produces a "rubber
+        # band into empty space" visual -- iPadOS does the same thing.
+        if offset_int < 0 and self.current_page + 1 < len(self.pages):
+            self._render_home_page(
+                frame, self.current_page + 1,
+                x_offset=offset_int + w, now_ms=now_ms,
+            )
+        elif offset_int > 0 and self.current_page - 1 >= 0:
+            self._render_home_page(
+                frame, self.current_page - 1,
+                x_offset=offset_int - w, now_ms=now_ms,
+            )
+
+    def _render_home_page(
+        self,
+        frame: np.ndarray,
+        page_idx: int,
+        x_offset: int,
+        now_ms: int,
+    ) -> None:
+        """Paint one home page's eight tiles into `frame` at `x_offset`.
+
+        Mirrors phase5_motion.paint_grid_with_motion but with two
+        extensions the Phase 8 multi-page path needs:
+
+            1. `x_offset` shifts each tile's x by a constant amount
+               so the whole page slides as one unit.  At offset=0 the
+               output matches the single-page renderer pixel for
+               pixel.
+            2. The hover scale is looked up with a PAGE-AWARE tile id
+               (page_idx * len(APPS) + slot), so a hovered tile on
+               page 0 doesn't pull its same-slot counterpart on page
+               1 into a hover scale.
+
+        The per-page FadeUpState comes from self._page_fade_states --
+        page 0 uses the staggered Phase 5 entry, page 1+ uses
+        pre-completed states so the swipe IS the entry visual.
+        """
+        assert self.geometry is not None
+        fade_states = self._page_fade_states[page_idx]
+        page_apps = self.pages[page_idx]
+
+        for slot, (app_id, display_name) in enumerate(page_apps):
+            tile_x, tile_y, _, _ = self.geometry.tile_rects[slot]
+            opacity, y_offset = fade_states[slot].value(now_ms)
+
+            # Page-aware hover id keeps hover state independent per
+            # page.  Reduced motion bypasses hover scaling entirely
+            # to match the Phase 5 / 7 convention.
+            if self.motion.reduced_motion:
+                scale = 1.0
+            else:
+                page_aware_id = page_idx * len(APPS) + slot
+                scale = self.motion.hover_state.scale_for(
+                    page_aware_id, now_ms,
+                )
+
+            _render_tile_with_motion(
+                frame, tile_x + x_offset, tile_y,
+                app_id, display_name, self._label_font,
+                opacity=opacity, y_offset=y_offset, scale=scale,
+            )
+
+    def _current_page_shifted_rects(
+        self,
+    ) -> list[tuple[int, int, int, int]]:
+        """Return the current page's tile rects shifted by drag_offset_px.
+
+        At rest (offset = 0) the result is identical to
+        geometry.tile_rects -- callers that hit-test against this
+        list behave exactly as Phase 7 did.  During an in-flight drag
+        or snap the rects move with the page, so hit-testing the
+        cursor against them lands on the tile the user's eye sees
+        under the cursor.
+
+        We rebuild the list per call rather than caching: the
+        operation is cheap (eight 4-tuples) and the cache would need
+        invalidation on every offset change, which is every frame.
+        """
+        assert self.geometry is not None
+        dx = int(round(self.drag_offset_px))
+        return [
+            (rx + dx, ry, rw, rh)
+            for (rx, ry, rw, rh) in self.geometry.tile_rects
+        ]
 
     def _render_app(
         self,
