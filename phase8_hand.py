@@ -50,6 +50,17 @@ import numpy as np
 
 from src.compositor import Compositor
 from src.design import draw_fps_hud, draw_text, load_font
+from phase6_app_window import _close_button_rect
+
+
+# How big the gaze-snap zone around the close button is.  Anything in
+# the top-left _CLOSE_SNAP_PX-by-_CLOSE_SNAP_PX square gets snapped
+# onto the close-button centre so the user can fire a close gesture
+# by glancing roughly at the corner instead of needing pixel-perfect
+# aim on a 32x32 target.  Tuned to be a quarter of a 1080p canvas:
+# big enough to land for a casual top-left glance, small enough that
+# a glance at the top centre still uses the raw gaze coordinate.
+_CLOSE_SNAP_PX: Final[int] = 280
 from phase1_canvas import (
     FPS_EMA_ALPHA,
     QUIT_KEY_ESC,
@@ -1016,11 +1027,32 @@ def main() -> None:
                     gaze_xy, compositor.geometry.tile_rects,
                 )
                 compositor.set_gaze_lock(locked)
+                compositor.set_close_button_focused(False)
                 if locked is not None:
                     tx, ty, tw, th = compositor.geometry.tile_rects[locked]
                     mouse_xy = (tx + tw // 2, ty + th // 2)
+            elif gaze_xy is not None and compositor.state == "app":
+                # Close-button snap.  The close button is 32x32 in
+                # the top-left corner; pixel-perfect gaze on a
+                # target that small is unrealistic.  When the gaze
+                # lands anywhere in the top-left ~ _CLOSE_SNAP_PX x
+                # _CLOSE_SNAP_PX region, snap mouse_xy to the close
+                # button's centre AND tell the compositor to paint
+                # the focus ring -- the user gets a clear "pinch
+                # closes the app" signal AND the pinch actually
+                # registers on the button rect.
+                compositor.set_gaze_lock(None)
+                in_snap_zone = (
+                    gaze_xy[0] < _CLOSE_SNAP_PX
+                    and gaze_xy[1] < _CLOSE_SNAP_PX
+                )
+                compositor.set_close_button_focused(in_snap_zone)
+                if in_snap_zone:
+                    cb_x, cb_y, cb_w, cb_h = _close_button_rect()
+                    mouse_xy = (cb_x + cb_w // 2, cb_y + cb_h // 2)
             else:
                 compositor.set_gaze_lock(None)
+                compositor.set_close_button_focused(False)
 
             # Page-drag dispatch.  Only meaningful on the home screen
             # -- drags that start inside an app are silently absorbed

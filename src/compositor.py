@@ -517,6 +517,13 @@ class Compositor:
         # so the chip doesn't jitter while the row is mid-flight.
         self._gaze_lock_tile_id: Optional[int] = None
 
+        # Close-button gaze focus.  True when the eye-driven cursor is
+        # in the close button's snap zone (top-left of the screen
+        # while an app is open).  Renders a small ring around the
+        # close button so the user knows a pinch will fire the
+        # close-app action.  Always False in HOME state.
+        self._close_button_focused: bool = False
+
     # ------------------------------------------------------------------
     # Public surface
     # ------------------------------------------------------------------
@@ -597,6 +604,44 @@ class Compositor:
         if tile_id is not None and not (0 <= tile_id < 8):
             tile_id = None
         self._gaze_lock_tile_id = tile_id
+
+    def set_close_button_focused(self, focused: bool) -> None:
+        """Record whether the eye-driven cursor is in the close-button snap zone.
+
+        Pass `True` when the gaze is in the top-left region of the
+        screen while an app is open (phase8 computes the zone); pass
+        `False` whenever the cursor leaves that zone or the OS
+        transitions back to HOME.  When True, `_render_app_for_id`
+        paints a focus ring around the close button so the user has
+        an unambiguous "a pinch will fire the close action" signal.
+        """
+        self._close_button_focused = focused
+
+    def _paint_close_button_focus(self, frame: np.ndarray) -> None:
+        """Draw a small focus ring around the close button when focused.
+
+        Same `_draw_rounded_border` helper the home gaze lock uses;
+        slightly thinner (1px instead of 2) and pinned a few pixels
+        out from the button's silhouette so the ring sits clearly
+        in the negative space around the X glyph rather than
+        crowding it.
+        """
+        if not self._close_button_focused:
+            return
+        cx, cy, cw, ch = _close_button_rect()
+        pad = 4
+        # Radius is half the (padded) button extent so the ring is
+        # a circle that just clears the 32px button.
+        radius = (cw + 2 * pad) // 2
+        _draw_rounded_border(
+            frame,
+            x=cx - pad, y=cy - pad,
+            w=cw + 2 * pad, h=ch + 2 * pad,
+            radius=radius,
+            color_bgr=_GAZE_LOCK_BORDER_BGR,
+            alpha=_GAZE_LOCK_BORDER_ALPHA,
+            thickness=1,
+        )
 
     def _paint_gaze_lock_chip(self, frame: np.ndarray) -> None:
         """Paint the gaze-lock Liquid Glass chip behind the locked tile.
@@ -1231,11 +1276,17 @@ class Compositor:
         TO app independently into separate buffers without each having
         to know about the current_app_id field.  RENDERERS is the same
         dispatch table Phase 6 uses; we just look up the right entry.
+
+        When the gaze is in the close-button snap zone, a thin focus
+        ring is drawn around the X glyph to signal that a pinch will
+        close the app.  Painted AFTER the close button so the ring
+        sits on top of the glass disc, not under it.
         """
         h, w = frame.shape[:2]
         renderer = RENDERERS[app_id]
         renderer(frame, w, h)  # type: ignore[operator]
         _draw_close_button(frame, app_id)
+        self._paint_close_button_focus(frame)
 
     def _compose_transition(
         self,
