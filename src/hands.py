@@ -738,6 +738,19 @@ class HandInput:
         self._latest_gaze_norm: Optional[tuple[float, float]] = None
         self._smoothed_gaze_norm: Optional[tuple[float, float]] = None
         self._gaze_baseline: Optional[tuple[float, float]] = None
+        # 5-point calibration: list of (gaze_norm, screen_xy) samples
+        # captured by `add_calibration_sample`, then a 2x3 affine
+        # matrix fitted by `fit_calibration` via numpy.linalg.lstsq.
+        # When the matrix is present, `gaze_cursor` uses it INSTEAD of
+        # the legacy `_gaze_baseline` delta path -- the multi-point
+        # affine is strictly better (corrects per-axis gain and any
+        # roll between iris and screen) but the single-baseline path
+        # is kept as a fallback for calibration runs that captured
+        # fewer than 3 samples.
+        self._calibration_samples: list[
+            tuple[tuple[float, float], tuple[float, float]]
+        ] = []
+        self._calibration_matrix: Optional[np.ndarray] = None
         # Face landmarks list -- one mediapipe NormalizedLandmarkList
         # when a face is detected, [] otherwise.  Used by the
         # calibration UI's overlay.
@@ -849,16 +862,14 @@ class HandInput:
             return list(self._latest_face_landmarks)
 
     def calibrate_gaze_center(self) -> bool:
-        """Snapshot the current smoothed gaze as the "looking at center" baseline.
+        """Legacy single-point calibration: snapshot smoothed gaze as the centre baseline.
 
-        Returns True on success, False if no face is currently
-        detected (in which case the baseline stays as whatever it
-        was before -- the operator can retry).
-
-        This is the one method that mutates the baseline; once set,
-        the baseline persists until close() or a subsequent
-        calibrate_gaze_center() call.  Mouse fallback is automatic
-        whenever the smoothed gaze is unavailable (face missing).
+        Returns True on success, False if no face is currently detected.
+        Kept for backward compatibility with callers that still issue
+        a single SPACE press.  New code should use the 5-point flow
+        (`reset_calibration` + `add_calibration_sample` * N +
+        `fit_calibration`); the multi-point path produces a strictly
+        more accurate cursor model.
         """
         with self._lock:
             if self._smoothed_gaze_norm is None:
@@ -866,44 +877,145 @@ class HandInput:
             self._gaze_baseline = self._smoothed_gaze_norm
         return True
 
-    def has_gaze_calibration(self) -> bool:
-        """Return True if a center-baseline has been captured."""
+    def reset_calibration(self) -> None:
+        """Drop every captured sample and the fitted affine matrix.
+
+        Call once at the start of a 5-point calibration run so a
+        previous calibration's samples don't pollute the new fit.
+        Also clears the legacy single-point baseline; the two paths
+        are mutually exclusive at gaze-cursor time but resetting
+        both makes the calibration screen's behaviour unambiguous.
+        """
         with self._lock:
-            return self._gaze_baseline is not None
+            self._calibration_samples.clear()
+            self._calibration_matrix = None
+            self._gaze_baseline = None
+
+    def add_calibration_sample(
+        self, screen_xy: tuple[int, int],
+    ) -> bool:
+        """Record one (current_gaze_norm, screen_target_xy) calibration pair.
+
+        Returns True on a successful capture, False if no face has been
+        detected yet (smoothed gaze is None).  Re-tryable: the caller
+        re-invokes after the user moves their head into the camera's
+        view.  Does NOT fit the model -- accumulates only.  Call
+        `fit_calibration` once all samples have been collected.
+
+        Thread-safe: the gaze reading and the samples list are both
+        accessed under `_lock`.  The screen_xy tuple is stored
+        verbatim; callers are responsible for passing canvas-pixel
+        coordinates that match what the OS will use at runtime.
+        """
+        with self._lock:
+            current = self._smoothed_gaze_norm
+            if current is None:
+                return False
+            self._calibration_samples.append((current, screen_xy))
+        return True
+
+    def fit_calibration(self) -> bool:
+        """Fit the 2x3 affine matrix from gaze_norm to screen pixels.
+
+        Requires at least 3 samples (the affine has 3 unknowns per
+        output axis; fewer samples are underdetermined and
+        np.linalg.lstsq would give junk).  With 5 samples the system
+        is overdetermined and lstsq returns the least-squares
+        minimum-error fit -- which is what we want against the
+        noisy smoothed-gaze readings.
+
+        Returns True on a successful fit (matrix stored on `self`),
+        False when there aren't enough samples.  The previous
+        matrix is preserved on failure so a partial recalibration
+        doesn't blow away the old model.
+        """
+        with self._lock:
+            samples = list(self._calibration_samples)
+        if len(samples) < 3:
+            return False
+
+        # Design matrix: each row is [gaze_x, gaze_y, 1] so the third
+        # column captures the bias term (the (0, 0) gaze_norm maps to
+        # some non-zero screen position).  lstsq solves Ax = b for each
+        # output axis independently.
+        a_rows = np.array(
+            [[gx, gy, 1.0] for (gx, gy), _ in samples], dtype=np.float64,
+        )
+        y_x = np.array([sx for _, (sx, _sy) in samples], dtype=np.float64)
+        y_y = np.array([sy for _, (_sx, sy) in samples], dtype=np.float64)
+        p_x, *_ = np.linalg.lstsq(a_rows, y_x, rcond=None)
+        p_y, *_ = np.linalg.lstsq(a_rows, y_y, rcond=None)
+
+        with self._lock:
+            self._calibration_matrix = np.stack([p_x, p_y], axis=0)
+        return True
+
+    def has_gaze_calibration(self) -> bool:
+        """Return True if either calibration path has been completed.
+
+        Either the new 5-point affine matrix OR the legacy single-
+        point baseline counts as 'calibrated'.  Callers use this to
+        decide whether the gaze can drive the cursor -- the legacy
+        path is still better than nothing for users who only press
+        SPACE once before the OS boots.
+        """
+        with self._lock:
+            return (
+                self._calibration_matrix is not None
+                or self._gaze_baseline is not None
+            )
 
     def gaze_cursor(
         self, canvas_w: int, canvas_h: int,
     ) -> Optional[tuple[int, int]]:
         """Return the gaze-driven cursor position in canvas pixels.
 
-        Math (only runs when both a baseline and a current smoothed
-        reading exist):
-            dx_norm = current_x - baseline_x
-            dy_norm = current_y - baseline_y
-            cursor_x = canvas_w / 2 + dx_norm * GAZE_GAIN_X * canvas_w
-            cursor_y = canvas_h / 2 + dy_norm * GAZE_GAIN_Y * canvas_h
+        Resolution order:
+            1. If the 5-point affine matrix is fitted, apply it:
+                   screen_x = M[0,0]*gx + M[0,1]*gy + M[0,2]
+                   screen_y = M[1,0]*gx + M[1,1]*gy + M[1,2]
+               This is strictly more accurate than the legacy delta
+               path because it learns per-axis gain AND any roll
+               between the iris-norm coordinate system and the
+               screen.
+            2. Else if a single-point baseline exists, use the legacy
+                   dx_norm = current - baseline
+                   cursor = canvas_centre + dx_norm * GAZE_GAIN * canvas_size
+               math.  Kept as a fallback for users who only ran the
+               original SPACE-press calibration.
+            3. Else return None -- no calibration available, the OS
+               falls back to the mouse.
 
-        Clamped to canvas bounds so a wild iris reading can't crash
-        the hover hit-test with a negative index.  Returns None
-        without a baseline OR without a current reading, in which
-        case the OS falls back to the mouse cursor (a deliberate
-        gentle-degradation rather than freezing the cursor at the
-        last-known position -- if the camera loses the face for
-        five seconds, mouse takes over).
+        Always clamped to canvas bounds so a wild iris reading can't
+        crash the hover hit-test with a negative index.  Returns None
+        without a current smoothed-gaze reading (face missing), in
+        which case the OS falls back to the mouse cursor.
         """
         with self._lock:
+            current  = self._smoothed_gaze_norm
+            matrix   = self._calibration_matrix
             baseline = self._gaze_baseline
-            current = self._smoothed_gaze_norm
-        if baseline is None or current is None:
+        if current is None:
             return None
-        dx_norm = current[0] - baseline[0]
-        dy_norm = current[1] - baseline[1]
-        cursor_x = int(round(
-            canvas_w * 0.5 + dx_norm * GAZE_GAIN_X * canvas_w,
-        ))
-        cursor_y = int(round(
-            canvas_h * 0.5 + dy_norm * GAZE_GAIN_Y * canvas_h,
-        ))
+
+        if matrix is not None:
+            gx, gy = current
+            sx = float(matrix[0, 0] * gx + matrix[0, 1] * gy + matrix[0, 2])
+            sy = float(matrix[1, 0] * gx + matrix[1, 1] * gy + matrix[1, 2])
+            cursor_x = int(round(sx))
+            cursor_y = int(round(sy))
+        elif baseline is not None:
+            dx_norm = current[0] - baseline[0]
+            dy_norm = current[1] - baseline[1]
+            cursor_x = int(round(
+                canvas_w * 0.5 + dx_norm * GAZE_GAIN_X * canvas_w,
+            ))
+            cursor_y = int(round(
+                canvas_h * 0.5 + dy_norm * GAZE_GAIN_Y * canvas_h,
+            ))
+        else:
+            return None
+
         cursor_x = max(0, min(canvas_w - 1, cursor_x))
         cursor_y = max(0, min(canvas_h - 1, cursor_y))
         return cursor_x, cursor_y
