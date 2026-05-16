@@ -998,11 +998,27 @@ def main() -> None:
             # screen; compositor's _paint_gaze_lock_chip skips the
             # paint during drags/snaps and when the OS is in app
             # state, so passing the latest snap every frame is safe.
+            #
+            # CRITICAL: when a lock is active we ALSO override
+            # mouse_xy with the locked tile's centre.  Reason: the
+            # compositor's click hit-test (and hover hit-test) reads
+            # the raw mouse_xy, so without this override a hand
+            # pinch fires "click at gaze_xy" which is usually a few
+            # pixels into the gutter between tiles -- the click
+            # then misses every tile rect and nothing happens.
+            # Snapping mouse_xy to the locked tile's centre means
+            # "what the chip shows" and "what the click hits" are
+            # the same point.  Only override in HOME state; in APP
+            # state the gaze should drive the close-button hit-test
+            # at raw coordinates (the chip isn't shown there).
             if gaze_xy is not None and compositor.state == "home" and compositor.geometry is not None:
                 locked = _nearest_tile_index(
                     gaze_xy, compositor.geometry.tile_rects,
                 )
                 compositor.set_gaze_lock(locked)
+                if locked is not None:
+                    tx, ty, tw, th = compositor.geometry.tile_rects[locked]
+                    mouse_xy = (tx + tw // 2, ty + th // 2)
             else:
                 compositor.set_gaze_lock(None)
 
