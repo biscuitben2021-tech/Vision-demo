@@ -154,6 +154,26 @@ GAZE_SMOOTH_ALPHA: float = 0.35
 GAZE_GAIN_X: float = 5.0
 GAZE_GAIN_Y: float = 9.0
 
+# Pretrained-mode projection (L2CS-Net yaw/pitch -> screen pixels).
+# Empirical pixels-per-degree for a user at ~50cm from a 13" MacBook:
+# the horizontal half-angle is ~18 degrees and the vertical half-
+# angle is ~11 degrees, so dividing canvas extent by twice those
+# gives ~40 px/deg in both axes.  Used by gaze_cursor's pretrained
+# branch when no per-user calibration is available.
+PRETRAINED_PX_PER_DEG_X: float = 40.0
+PRETRAINED_PX_PER_DEG_Y: float = 40.0
+# The MacBook's camera sits above the screen, so a user fixating on
+# the screen centre is gazing slightly DOWN from camera level --
+# pitch_raw ~= -10 degrees in L2CS's convention (positive pitch =
+# looking up).  Adding this OFFSET to the raw pitch shifts the
+# zero-point to "looking at screen centre":
+#     net_pitch = pitch_raw + offset
+#     pitch_raw = -10 + 10 = 0  ->  sy = canvas_h/2 (centre).  GOOD.
+# Sign is therefore POSITIVE.  An earlier draft had this negative,
+# which sent the cursor off the bottom of the screen for a user
+# looking at the centre.
+PRETRAINED_PITCH_OFFSET_DEG: float = 10.0
+
 # --- Pinch thresholds (REFERENCE VALUES, do not retune lightly) ------
 # Hysteresis: easier to keep a pinch than to start one.  The reference's
 # extensive tuning notes apply word-for-word, see Hand controller copy
@@ -634,7 +654,11 @@ class HandInput:
     # Construction / open
     # ------------------------------------------------------------------
 
-    def __init__(self, camera_index: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        camera_index: Optional[int] = None,
+        pretrained_gaze: Optional["PretrainedGaze"] = None,
+    ) -> None:
         """Open the camera and start the background thread.
 
         If `camera_index` is None, probe indices 0..CAMERA_PROBE_LIMIT-1
@@ -643,6 +667,15 @@ class HandInput:
         the OS's main thread on stdin.  The user can override the auto
         pick by passing `--camera N` on the CLI (phase8_hand.py wires
         that flag in).
+
+        If `pretrained_gaze` is non-None (a `PretrainedGaze` instance
+        loaded by the caller via `PretrainedGaze.try_load()`), the
+        background thread additionally runs L2CS-Net's gaze CNN on
+        each camera frame and stores `(yaw_deg, pitch_deg)` for the
+        gaze_cursor projection -- `--pretrained` mode in phase 8.
+        Construction does NOT load the model; pass an already-loaded
+        instance.  When pretrained gaze is unavailable the thread
+        skips that branch and the calibrated iris-norm path is used.
 
         Raises HandInputUnavailable on any open failure.  The caller is
         expected to fall back to mouse-only mode.
@@ -751,6 +784,16 @@ class HandInput:
             tuple[tuple[float, float], tuple[float, float]]
         ] = []
         self._calibration_matrix: Optional[np.ndarray] = None
+
+        # Pretrained-mode state.  The L2CS Pipeline (when provided)
+        # runs on the camera thread alongside MediaPipe; the latest
+        # yaw/pitch is stored here as a (yaw_deg, pitch_deg) tuple,
+        # or None when no face was detected on that frame.  The
+        # gaze_cursor projection consumes this when both fields are
+        # populated -- pretrained takes precedence over the
+        # calibrated affine.
+        self._pretrained_gaze = pretrained_gaze
+        self._latest_pretrained_yp: Optional[tuple[float, float]] = None
         # Face landmarks list -- one mediapipe NormalizedLandmarkList
         # when a face is detected, [] otherwise.  Used by the
         # calibration UI's overlay.
@@ -951,17 +994,21 @@ class HandInput:
         return True
 
     def has_gaze_calibration(self) -> bool:
-        """Return True if either calibration path has been completed.
+        """Return True if any cursor-driving gaze source is configured.
 
-        Either the new 5-point affine matrix OR the legacy single-
-        point baseline counts as 'calibrated'.  Callers use this to
-        decide whether the gaze can drive the cursor -- the legacy
-        path is still better than nothing for users who only press
-        SPACE once before the OS boots.
+        Three sources count as 'calibrated':
+            * The pretrained L2CS Pipeline (no per-user calibration
+              needed; the model's yaw/pitch IS the cursor source).
+            * The 5-point affine matrix (per-user calibration).
+            * The legacy single-point baseline (back-compat).
+
+        Callers use this to gate "show the gaze cursor" -- if none
+        of the three exist, the OS falls back to the mouse.
         """
         with self._lock:
             return (
-                self._calibration_matrix is not None
+                self._pretrained_gaze is not None
+                or self._calibration_matrix is not None
                 or self._gaze_baseline is not None
             )
 
@@ -970,35 +1017,56 @@ class HandInput:
     ) -> Optional[tuple[int, int]]:
         """Return the gaze-driven cursor position in canvas pixels.
 
-        Resolution order:
-            1. If the 5-point affine matrix is fitted, apply it:
+        Resolution order (first match wins):
+            1. If the pretrained L2CS Pipeline is wired in AND has
+               produced a yaw/pitch for the most recent frame, project
+               those angles to screen pixels:
+                   screen_x = canvas_w/2 + yaw_deg * px_per_deg_x
+                   screen_y = canvas_h/2 - (pitch + offset) * px_per_deg_y
+               Pretrained takes precedence because the whole point
+               of --pretrained is "skip the per-user calibration".
+            2. Else if the 5-point affine matrix is fitted, apply it:
                    screen_x = M[0,0]*gx + M[0,1]*gy + M[0,2]
                    screen_y = M[1,0]*gx + M[1,1]*gy + M[1,2]
-               This is strictly more accurate than the legacy delta
-               path because it learns per-axis gain AND any roll
-               between the iris-norm coordinate system and the
-               screen.
-            2. Else if a single-point baseline exists, use the legacy
+            3. Else if a single-point baseline exists, use the legacy
                    dx_norm = current - baseline
                    cursor = canvas_centre + dx_norm * GAZE_GAIN * canvas_size
-               math.  Kept as a fallback for users who only ran the
-               original SPACE-press calibration.
-            3. Else return None -- no calibration available, the OS
+               math.
+            4. Else return None -- no calibration available, the OS
                falls back to the mouse.
 
-        Always clamped to canvas bounds so a wild iris reading can't
+        Always clamped to canvas bounds so a wild reading can't
         crash the hover hit-test with a negative index.  Returns None
-        without a current smoothed-gaze reading (face missing), in
-        which case the OS falls back to the mouse cursor.
+        when the source is alive but no current reading exists (face
+        missing for that frame), in which case the OS falls back to
+        the mouse for one frame.
         """
         with self._lock:
-            current  = self._smoothed_gaze_norm
-            matrix   = self._calibration_matrix
-            baseline = self._gaze_baseline
-        if current is None:
-            return None
+            current        = self._smoothed_gaze_norm
+            matrix         = self._calibration_matrix
+            baseline       = self._gaze_baseline
+            pretrained_yp  = self._latest_pretrained_yp
+            has_pretrained = self._pretrained_gaze is not None
 
-        if matrix is not None:
+        # 1. Pretrained branch -- preferred when the model is loaded.
+        if has_pretrained:
+            if pretrained_yp is None:
+                return None
+            yaw_deg, pitch_deg = pretrained_yp
+            sx = canvas_w * 0.5 + yaw_deg * PRETRAINED_PX_PER_DEG_X
+            # pitch positive = looking up; screen y goes DOWN, so we
+            # subtract.  PITCH_OFFSET compensates for the laptop
+            # camera being above the screen (user looks at screen
+            # centre with a slight downward pitch).
+            sy = canvas_h * 0.5 - (
+                pitch_deg + PRETRAINED_PITCH_OFFSET_DEG
+            ) * PRETRAINED_PX_PER_DEG_Y
+            cursor_x = int(round(sx))
+            cursor_y = int(round(sy))
+        elif current is None:
+            # Iris-based paths both need a current smoothed reading.
+            return None
+        elif matrix is not None:
             gx, gy = current
             sx = float(matrix[0, 0] * gx + matrix[0, 1] * gy + matrix[0, 2])
             sy = float(matrix[1, 0] * gx + matrix[1, 1] * gy + matrix[1, 2])
@@ -1245,6 +1313,23 @@ class HandInput:
                 # skips the publish for one frame.
                 hand_results = self._hands_model.process(rgb)
                 face_results = self._face_mesh.process(rgb)
+                # Pretrained gaze inference runs on the camera thread
+                # so the OS render loop never pays the L2CS forward-
+                # pass latency synchronously.  step() takes BGR (cv2
+                # native); when no face is detected it returns None,
+                # which clears the published yaw/pitch and lets the
+                # gaze_cursor projection fall through to the
+                # calibrated path.  Caught defensively because torch
+                # forward passes can raise on degenerate frames and
+                # we don't want a single bad inference to kill the
+                # camera loop.
+                if self._pretrained_gaze is not None:
+                    try:
+                        yp = self._pretrained_gaze.step(frame)
+                    except Exception:                         # noqa: BLE001
+                        yp = None
+                    with self._lock:
+                        self._latest_pretrained_yp = yp
                 self._publish_results(frame, hand_results, face_results)
             except Exception:
                 # Defensive catch: a single bad frame should not stop

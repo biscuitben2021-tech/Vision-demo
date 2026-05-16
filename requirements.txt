@@ -39,3 +39,14 @@ Pillow>=10.0,<12
 # the line at the last release that still ships it.  Same pin the
 # Hand-controller reference project uses.
 mediapipe==0.10.14
+
+# --- Optional: --pretrained gaze (L2CS-Net) -----------------------
+# Uncomment OR pip-install on demand.  Required only when running
+# `python run.py --pretrained` (skips the 5-point calibration screen
+# in favour of a pretrained gaze CNN).  These are HEAVY:
+#     torch + torchvision  -- ~700 MB on Apple Silicon arm64
+#     L2CSNet_gaze360.pkl  -- ~88 MB, auto-downloaded by gdown
+#     face_detection       -- transitive of l2cs, brings RetinaFace
+# Skip these unless you actually want pretrained mode.
+#
+#   pip install git+https://github.com/edavalosanaya/L2CS-Net.git@main gdown

@@ -103,6 +103,7 @@ NOTIF_SCHEDULE: Final[list[tuple[int, str, str]]] = [
 
 _CLI_FLAG_REDUCED_MOTION: Final[str] = "--reduced-motion"
 _CLI_FLAG_CAMERA: Final[str] = "--camera"
+_CLI_FLAG_PRETRAINED: Final[str] = "--pretrained"
 
 
 def _parse_cli(argv: list[str]) -> argparse.Namespace:
@@ -133,6 +134,17 @@ def _parse_cli(argv: list[str]) -> argparse.Namespace:
         help=(
             "Override the auto-picked camera index.  Without this flag, "
             "the script probes 0..5 and uses the first working device."
+        ),
+    )
+    parser.add_argument(
+        _CLI_FLAG_PRETRAINED,
+        action="store_true",
+        help=(
+            "Use L2CS-Net pretrained gaze instead of the 5-point per-user "
+            "calibration.  Skips the calibration screen; the model's "
+            "yaw/pitch output is projected to screen pixels directly.  "
+            "Requires the l2cs pip package and the L2CSNet_gaze360.pkl "
+            "weights at assets/ (auto-downloaded on first use via gdown)."
         ),
     )
     return parser.parse_args(argv)
@@ -382,7 +394,10 @@ def _resolve_camera_index(cli_camera: Optional[int]) -> Optional[int]:
     return chosen
 
 
-def _try_construct_hand_input(camera_index: Optional[int]):
+def _try_construct_hand_input(
+    camera_index: Optional[int],
+    pretrained_gaze=None,
+):
     """Try to bring up the HandInput.  Return it on success, None on failure.
 
     src.hands itself is pure-Python at module scope (mediapipe is
@@ -391,6 +406,10 @@ def _try_construct_hand_input(camera_index: Optional[int]):
     work.  If that import nonetheless fails (e.g. a corrupted
     install), we still want the OS to boot in mouse-only mode -- so
     we wrap even the import in a try/except.
+
+    `pretrained_gaze` is forwarded straight to HandInput.__init__;
+    pass None for the calibrated path, or a PretrainedGaze instance
+    for --pretrained mode.
     """
     try:
         from src.hands import HandInput, HandInputUnavailable
@@ -402,7 +421,10 @@ def _try_construct_hand_input(camera_index: Optional[int]):
         )
         return None
     try:
-        hand_input = HandInput(camera_index=camera_index)
+        hand_input = HandInput(
+            camera_index=camera_index,
+            pretrained_gaze=pretrained_gaze,
+        )
     except HandInputUnavailable as exc:
         print(
             f"[phase8] Hand tracking unavailable: {exc}  "
@@ -837,6 +859,26 @@ def main() -> None:
     # available cameras and reads the operator's pick.
     chosen_camera = _resolve_camera_index(args.camera)
 
+    # Optional --pretrained model load.  Done BEFORE HandInput so
+    # the camera thread can receive the model and start running
+    # inference from its very first frame.  try_load() returns None
+    # on any failure (deps missing, weights missing, model load
+    # failure); we print the reason and fall through to the
+    # calibrated path -- the OS still boots either way.
+    pretrained_gaze = None
+    if args.pretrained:
+        from src.pretrained_gaze import PretrainedGaze
+        print(
+            "[phase8] --pretrained set: loading L2CS-Net "
+            "(skips the 5-point calibration screen)."
+        )
+        pretrained_gaze = PretrainedGaze.try_load()
+        if pretrained_gaze is None:
+            print(
+                "[phase8] L2CS could not be loaded -- "
+                "falling back to the calibrated path."
+            )
+
     # Bring up the HandInput BEFORE the OS window so the background
     # camera thread is producing readings by the time we draw the
     # first calibration dot.  Order: camera up -> fullscreen window
@@ -845,7 +887,9 @@ def main() -> None:
     if chosen_camera is None:
         hand_input = None
     else:
-        hand_input = _try_construct_hand_input(chosen_camera)
+        hand_input = _try_construct_hand_input(
+            chosen_camera, pretrained_gaze=pretrained_gaze,
+        )
 
     # Open the fullscreen window FIRST so calibration shows at the
     # same geometry the OS will run at.  Calibrating in a smaller
@@ -856,15 +900,23 @@ def main() -> None:
     screen_w, screen_h = screen_size(WINDOW_NAME)
 
     # 5-point calibration.  Only shown when hand input is online
-    # (no point asking the user to look at a dot if we can't read
-    # their gaze).  Returns False on ESC / quit / window-close /
-    # fewer than 3 samples; the OS still boots in mouse-only mode
-    # in that case.  The 0.4s sleep gives the camera + MediaPipe
-    # graph time to publish their first reading so the calibration
-    # screen's "face detected" indicator is accurate from frame 1.
-    if hand_input is not None:
+    # AND we're NOT in pretrained mode (pretrained skips per-user
+    # calibration entirely).  Returns False on ESC / quit / window-
+    # close / fewer than 3 samples; the OS still boots in mouse-
+    # only mode in that case.  The 0.4s sleep gives the camera +
+    # MediaPipe graph time to publish their first reading so the
+    # calibration screen's "face detected" indicator is accurate
+    # from frame 1.
+    if hand_input is not None and pretrained_gaze is None:
         time.sleep(0.4)
         _run_eye_calibration(hand_input, screen_w, screen_h)
+    elif hand_input is not None and pretrained_gaze is not None:
+        # Give the camera thread a moment to publish its first
+        # L2CS inference before the OS starts hit-testing against
+        # the gaze cursor.  Without this brief pause the first
+        # ~10 frames render with the mouse as cursor source, which
+        # reads as a hiccup.
+        time.sleep(0.4)
 
     # Reduced-motion detection.  Combines the argparse-parsed flag
     # (which is itself parsed against `_CLI_FLAG_REDUCED_MOTION`) with
