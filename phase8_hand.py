@@ -49,7 +49,7 @@ import cv2
 import numpy as np
 
 from src.compositor import Compositor
-from src.design import draw_fps_hud
+from src.design import draw_fps_hud, draw_gaze_cursor
 from phase1_canvas import (
     FPS_EMA_ALPHA,
     QUIT_KEY_ESC,
@@ -818,6 +818,12 @@ def main() -> None:
             # This is the load-bearing eye-control behaviour: the
             # user's gaze IS the cursor, and the mouse becomes the
             # fallback for when the camera loses the face.
+            #
+            # gaze_xy is kept in scope (not None only when the gaze
+            # pipeline is live) so the post-compose pass can paint
+            # the visible gaze marker AT the same coordinates the
+            # hover hit-test just consumed.
+            gaze_xy: Optional[tuple[int, int]] = None
             if hand_input is not None:
                 gaze_xy = hand_input.gaze_cursor(canvas_w, canvas_h)
                 if gaze_xy is not None:
@@ -868,6 +874,16 @@ def main() -> None:
             # hand_input is None.
             if hand_input is not None:
                 hand_input.draw_thumbnail(frame)
+
+            # Gaze marker: a soft glowing ball that tracks the eye-
+            # driven cursor.  Painted LAST so it sits on top of every
+            # other layer (status bar, notifications, FPS HUD, hand
+            # thumbnail).  Only shown when gaze is the cursor source
+            # this frame -- if we've fallen back to the mouse the
+            # system pointer is already visible, so a synthetic marker
+            # would just duplicate it.
+            if gaze_xy is not None:
+                draw_gaze_cursor(frame, gaze_xy[0], gaze_xy[1])
 
             # Plain cv2.imshow -- same call Phase 7 uses.  AppKit
             # handles the Retina scaling on the display side; passing

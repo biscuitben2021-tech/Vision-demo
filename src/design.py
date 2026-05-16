@@ -640,6 +640,144 @@ def draw_fps_hud(frame: np.ndarray, fps: float) -> None:
 
 
 # ============================================================================
+# Gaze cursor -- a soft glowing dot that tracks where the user is looking
+# ============================================================================
+#
+# When the gaze pipeline is driving the cursor (rather than the mouse),
+# there is no built-in indicator showing WHERE that gaze cursor sits --
+# the system mouse pointer is no longer the source of truth.  Without a
+# visible marker the audience cannot tell whether the OS thinks the
+# user is looking at the Music tile or the Notes tile, and a hover
+# highlight alone is too quiet to read at a distance.
+#
+# The gaze ball is three concentric circles painted via cv2.circle with
+# LINE_AA, all alpha-blended onto the canvas through a small RGBA patch:
+#
+#     1. Outer halo -- 28px radius, near-white, ~12% opacity.  Soft
+#        ambient glow around the eye position.
+#     2. Mid ring   -- 14px radius, near-white, ~45% opacity, 2px stroke
+#        (drawn unfilled).  The visible "ring" of the gaze marker.
+#     3. Inner dot  -- 4px radius, near-white, 90% opacity, filled.
+#        The crisp centre point that tracks pixel-exact gaze.
+#
+# Total visual extent ~56px square -- comfortably within a single
+# RADIUS_APP_ICON tile but big enough to read from across the room.
+
+# Gaze ball geometry.  All radii are in pixels.  The patch is sized so
+# the outer halo plus a 4px breathing margin fits inside.
+_GAZE_PATCH_RADIUS:    Final[int] = 32     # half-width of the RGBA patch
+_GAZE_HALO_RADIUS:     Final[int] = 28
+_GAZE_RING_RADIUS:     Final[int] = 14
+_GAZE_RING_STROKE:     Final[int] = 2
+_GAZE_DOT_RADIUS:      Final[int] = 4
+
+# Alpha values in 0..255 (PIL's native alpha range).  Tuned so the
+# whole marker reads as a soft glow rather than a hard CAD cursor.
+_GAZE_HALO_ALPHA:      Final[int] = 30      # 12%
+_GAZE_RING_ALPHA:      Final[int] = 115     # 45%
+_GAZE_DOT_ALPHA:       Final[int] = 230     # 90%
+
+# Cursor colour.  Near-white, very faintly cool (255, 250, 245 BGR =
+# 245, 250, 255 RGB).  Pure (255, 255, 255) reads as a fluorescent
+# spot; the slight blue lift in RGB matches the rim-highlight colour
+# the Liquid Glass panels use, so the marker visually belongs to the
+# same chrome family.
+_GAZE_COLOR_BGR:       Final[tuple[int, int, int]] = (255, 250, 245)
+
+
+def _build_gaze_patch() -> np.ndarray:
+    """Build the cached RGBA gaze-marker patch, one row of (h, w, 4) uint8.
+
+    Pure geometry -- depends only on the constants above -- so it's
+    safe to memoise and reuse for every call to `draw_gaze_cursor`.
+    The patch is drawn once per process; per-frame cost of the gaze
+    cursor is then just the alpha composite of a 64x64 patch.
+
+    BGRA byte order (cv2 native), alpha = 0 in the corners so the
+    halo's circular shape doesn't paint over the wallpaper outside
+    the marker.
+    """
+    diameter = _GAZE_PATCH_RADIUS * 2
+    patch = np.zeros((diameter, diameter, 4), dtype=np.uint8)
+    centre = (_GAZE_PATCH_RADIUS, _GAZE_PATCH_RADIUS)
+
+    # 1. Outer halo: filled circle, low alpha.  Painted first so the
+    #    later passes layer cleanly on top.
+    cv2.circle(
+        patch, centre, _GAZE_HALO_RADIUS,
+        (*_GAZE_COLOR_BGR, _GAZE_HALO_ALPHA),
+        thickness=-1, lineType=cv2.LINE_AA,
+    )
+    # 2. Mid ring: stroked circle (thickness=_GAZE_RING_STROKE), mid alpha.
+    cv2.circle(
+        patch, centre, _GAZE_RING_RADIUS,
+        (*_GAZE_COLOR_BGR, _GAZE_RING_ALPHA),
+        thickness=_GAZE_RING_STROKE, lineType=cv2.LINE_AA,
+    )
+    # 3. Inner dot: small filled circle, high alpha.
+    cv2.circle(
+        patch, centre, _GAZE_DOT_RADIUS,
+        (*_GAZE_COLOR_BGR, _GAZE_DOT_ALPHA),
+        thickness=-1, lineType=cv2.LINE_AA,
+    )
+    return patch
+
+
+# Module-level cache for the BGRA gaze patch (built once on first call).
+_GAZE_PATCH_CACHE: dict[str, np.ndarray] = {}
+
+
+def draw_gaze_cursor(frame: np.ndarray, x: int, y: int) -> None:
+    """Composite the gaze-marker glyph onto `frame` centred at (x, y).
+
+    Mutates `frame` in place.  Off-canvas placements are silently
+    clipped -- if the gaze drifts to the very edge of the screen the
+    visible portion of the marker still composites correctly.
+
+    Args:
+        frame: BGR uint8 image, mutated in place.  Should be the
+               renderer's final output -- the gaze cursor belongs at
+               the top of the paint order so it never gets occluded
+               by the status bar or a sliding notification.
+        x, y:  centre of the marker in canvas pixels.
+
+    The patch is cached on first call so steady-state cost is just
+    the alpha composite of a 64x64 region -- under a millisecond on
+    the M2.  Colour-space convention: BGR in, BGRA patch -> BGR
+    composite using the patch's alpha channel.
+    """
+    patch = _GAZE_PATCH_CACHE.get("default")
+    if patch is None:
+        patch = _build_gaze_patch()
+        _GAZE_PATCH_CACHE["default"] = patch
+
+    ph, pw = patch.shape[:2]
+    paste_x = x - pw // 2
+    paste_y = y - ph // 2
+
+    frame_h, frame_w = frame.shape[:2]
+    x0 = max(0, paste_x)
+    y0 = max(0, paste_y)
+    x1 = min(frame_w, paste_x + pw)
+    y1 = min(frame_h, paste_y + ph)
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    sx0 = x0 - paste_x
+    sy0 = y0 - paste_y
+    sx1 = sx0 + (x1 - x0)
+    sy1 = sy0 + (y1 - y0)
+
+    src_bgr   = patch[sy0:sy1, sx0:sx1, :3].astype(np.float32)
+    src_alpha = patch[sy0:sy1, sx0:sx1,  3].astype(np.float32) * (1.0 / 255.0)
+    src_alpha = src_alpha[..., np.newaxis]
+    dst = frame[y0:y1, x0:x1].astype(np.float32)
+    out = src_bgr * src_alpha + dst * (1.0 - src_alpha)
+    np.clip(out, 0.0, 255.0, out=out)
+    frame[y0:y1, x0:x1] = out.astype(np.uint8)
+
+
+# ============================================================================
 # HiDPI display wrapper
 # ============================================================================
 #
