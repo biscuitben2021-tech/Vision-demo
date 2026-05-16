@@ -70,13 +70,29 @@ from src.apps import RENDERERS
 from src.design import (
     GAP_VIEWPORT,
     NAV_HEIGHT,
+    RADIUS_APP_ICON,
     RADIUS_TILE_SMALL,
     TEXT_MUTED_RGB,
     TEXT_ON_DARK_RGB,
     draw_text,
     load_font,
 )
-from src.icons import draw_glass_panel, paint_warm_aurora
+from src.icons import (
+    _draw_rounded_border,
+    draw_glass_panel,
+    paint_warm_aurora,
+)
+
+
+# Gaze-lock chip styling (see Compositor._paint_gaze_lock_chip).
+# Padding controls how much the chip extends past the locked tile;
+# intensity is forwarded to draw_glass_panel; border alpha is the
+# per-pixel blend factor for the 1px focus ring.
+_GAZE_LOCK_PAD:            Final[int]                  = 12
+_GAZE_LOCK_INTENSITY:      Final[float]                = 0.9
+_GAZE_LOCK_BORDER_BGR:     Final[tuple[int, int, int]] = (250, 250, 255)
+_GAZE_LOCK_BORDER_ALPHA:   Final[float]                = 0.80
+_GAZE_LOCK_BORDER_PX:      Final[int]                  = 2
 from src.motion import ease_emphasized
 
 # Phase imports.  Same pattern Phase 6 uses to lean on Phase 5 / Phase 4
@@ -492,6 +508,15 @@ class Compositor:
         self._wordmark_font, self._clock_font = _get_status_bar_fonts()
         self._label_font = _get_label_font()
 
+        # Gaze lock: index 0..7 of the home-tile that the eye-driven
+        # cursor is currently pointing at, or None when no lock should
+        # be drawn.  Driven externally via `set_gaze_lock`; consumed by
+        # `_paint_gaze_lock_chip` which paints a Liquid Glass selection
+        # chip BEHIND the locked tile so it reads as a "you are looking
+        # here" focus indicator.  Suppressed during page drags / snaps
+        # so the chip doesn't jitter while the row is mid-flight.
+        self._gaze_lock_tile_id: Optional[int] = None
+
     # ------------------------------------------------------------------
     # Public surface
     # ------------------------------------------------------------------
@@ -553,6 +578,75 @@ class Compositor:
         self._drag_active = True
         self.drag_offset_px = 0.0
         self.page_snap = None
+
+    def set_gaze_lock(self, tile_id: Optional[int]) -> None:
+        """Record the home-tile index the eye-driven cursor is locked onto.
+
+        Pass `None` to clear the lock (the gaze cursor is currently in
+        space the renderer doesn't care about, or the gaze pipeline is
+        not driving the cursor this frame).  Anything else is a tile
+        index in the current page's 0..7 roster -- out-of-range values
+        are coerced to None silently rather than crashing the paint.
+
+        The chip is painted INSIDE `_render_home` (between the wallpaper
+        and the grid) so the locked tile sits over the chip with its
+        10px halo peeking out as the focus indicator.  The chip is
+        suppressed during page drags / snaps -- a moving chip would
+        flicker between tiles as the gaze re-snaps each frame.
+        """
+        if tile_id is not None and not (0 <= tile_id < 8):
+            tile_id = None
+        self._gaze_lock_tile_id = tile_id
+
+    def _paint_gaze_lock_chip(self, frame: np.ndarray) -> None:
+        """Paint the gaze-lock Liquid Glass chip behind the locked tile.
+
+        Chip geometry: 10px bigger than the tile on each side
+        (so the icon's rounded silhouette sits CENTRED inside it),
+        rendered as a Liquid Glass panel at intensity=0.7 (a touch
+        dimmer than the status bar at 1.0 so the chip recedes
+        behind the icon visually).  A 1px near-white border at 60%
+        opacity traces the chip's rounded silhouette as the "focus
+        ring" -- the part the audience picks up first.
+
+        No-op when no lock is set, when the geometry hasn't been
+        built yet, OR when a page drag / snap is in flight (the lock
+        chip would jitter every frame as the gaze re-snapped during
+        the swipe; far more readable to suppress it until the page
+        settles).
+        """
+        if self._gaze_lock_tile_id is None:
+            return
+        if self.geometry is None:
+            return
+        if self._drag_active or self.page_snap is not None:
+            return
+        if not (0 <= self._gaze_lock_tile_id < len(self.geometry.tile_rects)):
+            return
+
+        tx, ty, tw, th = self.geometry.tile_rects[self._gaze_lock_tile_id]
+        pad = _GAZE_LOCK_PAD
+        chip_x = tx - pad
+        chip_y = ty - pad
+        chip_w = tw + 2 * pad
+        chip_h = th + 2 * pad
+        # Chip radius scales proportionally with size so the visual
+        # roundness matches the underlying tile.  RADIUS_APP_ICON is
+        # 28 for a 140x140 tile; scaled to 160x160 we want ~32.
+        chip_r = RADIUS_APP_ICON + pad // 2
+
+        draw_glass_panel(
+            frame,
+            x=chip_x, y=chip_y, w=chip_w, h=chip_h, radius=chip_r,
+            intensity=_GAZE_LOCK_INTENSITY,
+        )
+        _draw_rounded_border(
+            frame,
+            x=chip_x, y=chip_y, w=chip_w, h=chip_h, radius=chip_r,
+            color_bgr=_GAZE_LOCK_BORDER_BGR,
+            alpha=_GAZE_LOCK_BORDER_ALPHA,
+            thickness=_GAZE_LOCK_BORDER_PX,
+        )
 
     def update_page_drag(self, dx: int) -> None:
         """Update the in-flight page-drag offset.  No-op if no drag is active.
@@ -994,6 +1088,12 @@ class Compositor:
         # don't have separate wallpapers (a future Phase could, but
         # the Vision Pro home pages all share one environment).
         paint_warm_aurora(frame, w, h)
+
+        # Gaze lock chip BEFORE the tiles, so the locked tile sits ON
+        # TOP of the chip and the chip's 10px padding peeks out around
+        # the icon's silhouette as the "you are looking here" focus
+        # ring.  Suppressed during page drags / snaps to avoid jitter.
+        self._paint_gaze_lock_chip(frame)
 
         offset_int = int(round(self.drag_offset_px))
         # Render the current page at its drag offset.  When offset is

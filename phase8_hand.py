@@ -49,7 +49,7 @@ import cv2
 import numpy as np
 
 from src.compositor import Compositor
-from src.design import draw_fps_hud, draw_gaze_cursor
+from src.design import draw_fps_hud
 from phase1_canvas import (
     FPS_EMA_ALPHA,
     QUIT_KEY_ESC,
@@ -197,6 +197,41 @@ def _mouse_callback(
     if event == cv2.EVENT_LBUTTONDOWN:
         param.mouse_xy = (x, y)
         param.pending_click = True
+
+
+def _nearest_tile_index(
+    xy: tuple[int, int],
+    tile_rects: list[tuple[int, int, int, int]],
+) -> Optional[int]:
+    """Return the index of the tile whose centre is closest to `xy`.
+
+    Unlike phase5_motion.closest_tile (which only returns a tile when
+    the cursor is INSIDE one), this helper returns the nearest tile
+    regardless of whether the cursor's actually on it -- which is the
+    behaviour the gaze-lock wants.  Even when the user's iris drift
+    lands the gaze a few pixels into the gutter, the lock should still
+    pick "the tile they were obviously looking at".
+
+    Returns None only when `tile_rects` is empty -- a defensive case
+    that protects against geometry-not-yet-built states.
+
+    Distance is squared-Euclidean against each tile's centre point;
+    no square root is taken because argmin doesn't need it (monotone
+    under sqrt).
+    """
+    if not tile_rects:
+        return None
+    x, y = xy
+    best_idx = 0
+    best_d2 = None
+    for i, (tx, ty, tw, th) in enumerate(tile_rects):
+        cx = tx + tw // 2
+        cy = ty + th // 2
+        d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy)
+        if best_d2 is None or d2 < best_d2:
+            best_idx = i
+            best_d2 = d2
+    return best_idx
 
 
 def _fire_due_notifications(
@@ -820,14 +855,28 @@ def main() -> None:
             # fallback for when the camera loses the face.
             #
             # gaze_xy is kept in scope (not None only when the gaze
-            # pipeline is live) so the post-compose pass can paint
-            # the visible gaze marker AT the same coordinates the
-            # hover hit-test just consumed.
+            # pipeline is live) so the post-compose pass can compute
+            # the locked tile AT the same coordinates the hover
+            # hit-test just consumed.
             gaze_xy: Optional[tuple[int, int]] = None
             if hand_input is not None:
                 gaze_xy = hand_input.gaze_cursor(canvas_w, canvas_h)
                 if gaze_xy is not None:
                     mouse_xy = gaze_xy
+
+            # Gaze lock: snap to the NEAREST home-tile so the user
+            # gets unambiguous focus feedback even when the raw gaze
+            # lands between icons.  Only meaningful on the home
+            # screen; compositor's _paint_gaze_lock_chip skips the
+            # paint during drags/snaps and when the OS is in app
+            # state, so passing the latest snap every frame is safe.
+            if gaze_xy is not None and compositor.state == "home" and compositor.geometry is not None:
+                locked = _nearest_tile_index(
+                    gaze_xy, compositor.geometry.tile_rects,
+                )
+                compositor.set_gaze_lock(locked)
+            else:
+                compositor.set_gaze_lock(None)
 
             # Page-drag dispatch.  Only meaningful on the home screen
             # -- drags that start inside an app are silently absorbed
@@ -875,15 +924,13 @@ def main() -> None:
             if hand_input is not None:
                 hand_input.draw_thumbnail(frame)
 
-            # Gaze marker: a soft glowing ball that tracks the eye-
-            # driven cursor.  Painted LAST so it sits on top of every
-            # other layer (status bar, notifications, FPS HUD, hand
-            # thumbnail).  Only shown when gaze is the cursor source
-            # this frame -- if we've fallen back to the mouse the
-            # system pointer is already visible, so a synthetic marker
-            # would just duplicate it.
-            if gaze_xy is not None:
-                draw_gaze_cursor(frame, gaze_xy[0], gaze_xy[1])
+            # Note: the soft glowing gaze ball used to live here.  It
+            # was replaced by the gaze-lock chip rendered inside the
+            # compositor's _render_home -- the chip wraps the closest
+            # tile to where the user is looking, giving an
+            # unambiguous "you are focused on Music" signal even when
+            # the underlying iris-delta gaze drifts a few px between
+            # tiles.  See compositor.set_gaze_lock above.
 
             # Plain cv2.imshow -- same call Phase 7 uses.  AppKit
             # handles the Retina scaling on the display side; passing

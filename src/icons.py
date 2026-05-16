@@ -663,6 +663,111 @@ def draw_glass_panel(
     frame[y0:y1, x0:x1] = _apply_rounded_mask(under, surface, mask)
 
 
+def _draw_rounded_border(
+    frame: np.ndarray,
+    x: int, y: int, w: int, h: int, radius: int,
+    color_bgr: tuple[int, int, int],
+    alpha: float = 1.0,
+    thickness: int = 1,
+) -> None:
+    """Stroke a 1-2px rounded-rect outline onto `frame` at (x, y, w, h, radius).
+
+    The outline is composed from four straight edges (cv2.line) and
+    four corner arcs (cv2.ellipse), all drawn with LINE_AA for soft
+    edges.  When `alpha < 1`, the border is drawn onto a copy of the
+    affected region and `cv2.addWeighted`-blended back at the given
+    alpha; this is what lets the gaze-lock chip's focus ring sit at
+    60% opacity (a hard 100% white stroke reads as a CAD outline and
+    competes with the icon underneath).
+
+    Colour-space convention: BGR `frame`, BGR `color_bgr` -- no
+    cv2/PIL boundary inside this helper.
+
+    Args:
+        frame:       BGR uint8 image, mutated in place.
+        x, y, w, h:  outline's bounding rect.
+        radius:      corner radius matching the underlying rect.
+        color_bgr:   stroke colour.
+        alpha:       0.0..1.0 opacity of the stroke against the
+                     pre-existing pixels.  1.0 is a hard stroke;
+                     0.5-0.7 is the standard "soft focus ring" range.
+        thickness:   stroke width in pixels.  Beyond 2 the corner
+                     arcs visibly slot inside the straight edges --
+                     keep it thin.
+    """
+    frame_h, frame_w = frame.shape[:2]
+
+    # Clip a tight ROI around the stroked path so the addWeighted blend
+    # below is O(perimeter) instead of O(frame).  We pad by `thickness`
+    # on each side so the stroke's full pixel footprint sits inside
+    # the ROI -- without that the bottom and right edges round off.
+    pad = thickness
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(frame_w, x + w + pad)
+    y1 = min(frame_h, y + h + pad)
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    # Draw onto a buffer we can alpha-blend back; for alpha==1 we can
+    # write straight into the frame ROI without a copy.
+    if alpha >= 0.999:
+        target = frame[y0:y1, x0:x1]
+        roi_ox, roi_oy = x0, y0
+    else:
+        target = frame[y0:y1, x0:x1].copy()
+        roi_ox, roi_oy = x0, y0
+
+    # Translate the stroke geometry into the ROI's local coordinate
+    # space.  The straight-edge endpoints sit at the four corners of
+    # the rounded rect, offset by `radius` along each axis.
+    lx = x - roi_ox
+    ly = y - roi_oy
+
+    cv2.line(
+        target, (lx + radius,     ly),
+                (lx + w - radius, ly),
+        color_bgr, thickness, cv2.LINE_AA,
+    )  # top
+    cv2.line(
+        target, (lx + radius,     ly + h - 1),
+                (lx + w - radius, ly + h - 1),
+        color_bgr, thickness, cv2.LINE_AA,
+    )  # bottom
+    cv2.line(
+        target, (lx,         ly + radius),
+                (lx,         ly + h - radius),
+        color_bgr, thickness, cv2.LINE_AA,
+    )  # left
+    cv2.line(
+        target, (lx + w - 1, ly + radius),
+                (lx + w - 1, ly + h - radius),
+        color_bgr, thickness, cv2.LINE_AA,
+    )  # right
+
+    # Corner arcs.  Angles in OpenCV image-space go clockwise from +x.
+    # Top-left: 180 -> 270, top-right: 270 -> 360, bottom-right: 0 -> 90,
+    # bottom-left: 90 -> 180.
+    arc = lambda cx, cy, a0, a1: cv2.ellipse(
+        target, (cx, cy), (radius, radius),
+        0.0, a0, a1, color_bgr, thickness, cv2.LINE_AA,
+    )
+    arc(lx + radius,         ly + radius,         180.0, 270.0)
+    arc(lx + w - radius - 1, ly + radius,         270.0, 360.0)
+    arc(lx + w - radius - 1, ly + h - radius - 1,   0.0,  90.0)
+    arc(lx + radius,         ly + h - radius - 1,  90.0, 180.0)
+
+    if alpha < 0.999:
+        # Blend the stroked copy back into the frame at the requested
+        # alpha.  Unchanged pixels in `target` (== original ROI) do
+        # alpha*p + (1-alpha)*p = p, so they stay untouched; only the
+        # stroked pixels shift toward `color_bgr` by `alpha`.
+        cv2.addWeighted(
+            target, alpha, frame[y0:y1, x0:x1], 1.0 - alpha,
+            0.0, dst=frame[y0:y1, x0:x1],
+        )
+
+
 # ============================================================================
 # App icon dispatch + glyphs
 # ============================================================================
