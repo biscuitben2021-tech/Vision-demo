@@ -43,7 +43,7 @@ import sys
 import time
 import warnings
 from dataclasses import dataclass, field
-from typing import Final, Optional
+from typing import Any, Final, Optional
 
 import cv2
 import numpy as np
@@ -293,6 +293,51 @@ def _update_fps(prev_t: float, prev_ema: float) -> tuple[float, float, float]:
     return now, dt, new_ema
 
 
+def _wait_for_fullscreen_geometry(
+    window_name: str,
+    max_iterations: int = 12,
+    poll_ms: int = 20,
+) -> tuple[int, int]:
+    """Pump the cv2 event loop until `screen_size` returns stable dims.
+
+    On macOS the fullscreen promotion is animated -- cv2's
+    getWindowImageRect can report (0, 0, 0, 0) or the
+    DEFAULT_W/DEFAULT_H fallback for the first few iterations after
+    `setWindowProperty(FULLSCREEN)`.  Without this helper, the
+    calibration screen (which reads screen_size ONCE right after
+    promotion) can fit its 5-point affine against the wrong target
+    coordinates -- absolute pixels up to 1920/1080 even when the
+    real fullscreen is smaller (e.g. 1470x919 on a 13" MacBook Air).
+    The OS loop's gaze_cursor then clamps to the smaller real extent
+    and the right/bottom edges of the screen become unreachable
+    by gaze.
+
+    We poll up to `max_iterations` times waiting for two consecutive
+    `screen_size` calls to return the same dimensions.  Each poll
+    pumps cv2 events via a 1px imshow + brief waitKey so macOS has
+    time to finalise the window geometry.  Returns the final
+    (width, height); if stability is never achieved within the budget
+    we still return whatever screen_size last reported (best effort).
+
+    `poll_ms` is the per-iteration waitKey timeout; the total time
+    budget is `max_iterations * poll_ms` worst case -- ~240ms with
+    the defaults, well below the user-perceptible threshold.
+    """
+    # 1x1 black placeholder kept tiny so cv2 doesn't allocate a large
+    # buffer on the first frame.  The window is already fullscreen --
+    # imshow during this warmup just pumps the event loop.
+    placeholder = np.zeros((1, 1, 3), dtype=np.uint8)
+    last_w, last_h = screen_size(window_name)
+    for _ in range(max_iterations):
+        cv2.imshow(window_name, placeholder)
+        cv2.waitKey(poll_ms)
+        cur_w, cur_h = screen_size(window_name)
+        if cur_w == last_w and cur_h == last_h and cur_w > 0 and cur_h > 0:
+            return cur_w, cur_h
+        last_w, last_h = cur_w, cur_h
+    return last_w, last_h
+
+
 # ----------------------------------------------------------------------------
 # Hand-input bring-up -- defensive construction
 # ----------------------------------------------------------------------------
@@ -407,8 +452,8 @@ def _resolve_camera_index(cli_camera: Optional[int]) -> Optional[int]:
 
 def _try_construct_hand_input(
     camera_index: Optional[int],
-    pretrained_gaze=None,
-):
+    pretrained_gaze: Optional[Any] = None,
+) -> Optional[Any]:
     """Try to bring up the HandInput.  Return it on success, None on failure.
 
     src.hands itself is pure-Python at module scope (mediapipe is
@@ -681,7 +726,7 @@ _CAL_POINTS: Final[tuple[tuple[str, float, float], ...]] = (
 
 
 def _run_eye_calibration(
-    hand_input, screen_w: int, screen_h: int,
+    hand_input: Any, screen_w: int, screen_h: int,
 ) -> bool:
     """5-point fullscreen calibration: TL -> TR -> BR -> BL -> Centre.
 
@@ -857,8 +902,10 @@ def main() -> None:
     cannot accidentally obscure the more-important diagnostic.
 
     Defensive shutdown: hand_input.close() runs in a finally block
-    so the camera handle is released even if compose_frame raises
-    or the cv2 window is closed mid-frame.
+    that wraps EVERYTHING after construction (calibration, compositor
+    setup, the render loop).  The camera handle is released even if
+    calibration raises, compose_frame raises mid-loop, or the cv2
+    window is closed mid-frame -- every exit path runs close().
     """
     args = _parse_cli(sys.argv[1:])
 
@@ -902,59 +949,80 @@ def main() -> None:
             chosen_camera, pretrained_gaze=pretrained_gaze,
         )
 
-    # Open the fullscreen window FIRST so calibration shows at the
-    # same geometry the OS will run at.  Calibrating in a smaller
-    # window then handing off to a bigger fullscreen would shift the
-    # corner targets outside the trained iris-norm range and the
-    # cursor would land off-screen at the extremes.
-    make_fullscreen_window(WINDOW_NAME)
-    screen_w, screen_h = screen_size(WINDOW_NAME)
-
-    # 5-point calibration.  Only shown when hand input is online
-    # AND we're NOT in pretrained mode (pretrained skips per-user
-    # calibration entirely).  Returns False on ESC / quit / window-
-    # close / fewer than 3 samples; the OS still boots in mouse-
-    # only mode in that case.  The 0.4s sleep gives the camera +
-    # MediaPipe graph time to publish their first reading so the
-    # calibration screen's "face detected" indicator is accurate
-    # from frame 1.
-    if hand_input is not None and pretrained_gaze is None:
-        time.sleep(0.4)
-        _run_eye_calibration(hand_input, screen_w, screen_h)
-    elif hand_input is not None and pretrained_gaze is not None:
-        # Give the camera thread a moment to publish its first
-        # L2CS inference before the OS starts hit-testing against
-        # the gaze cursor.  Without this brief pause the first
-        # ~10 frames render with the mouse as cursor source, which
-        # reads as a hiccup.
-        time.sleep(0.4)
-
-    # Reduced-motion detection.  Combines the argparse-parsed flag
-    # (which is itself parsed against `_CLI_FLAG_REDUCED_MOTION`) with
-    # the legacy sys.argv check and the cv2 R-key poll, so a user who
-    # is still in the habit of typing `--reduced-motion` directly gets
-    # the same effect.  reduced_motion_requested_via_cli is a no-op if
-    # the flag isn't present, so OR-chaining with args.reduced_motion
-    # is safe.
-    reduced_motion = (
-        args.reduced_motion
-        or reduced_motion_requested_via_cli()
-        or reduced_motion_requested_via_keypoll()
-    )
-
-    compositor = Compositor(reduced_motion=reduced_motion)
-    ctx = _MainLoopContext()
-    cv2.setMouseCallback(WINDOW_NAME, _mouse_callback, ctx)
-
-    # Time baseline -- cv2 tick clock, the same one phase5's
-    # now_ms_relative reads.  Compositor expects now_ms relative to
-    # this baseline.
-    t0_ticks = cv2.getTickCount()
-
-    last_t = time.perf_counter() - (1.0 / 60.0)
-    fps_ema = 0.0
-
+    # BUG FIX: the try/finally covers EVERYTHING after hand_input was
+    # constructed.  Previously the try block opened immediately before
+    # the main render loop; an exception raised during calibration
+    # (or compositor construction, or setMouseCallback) would skip
+    # hand_input.close() and leak the camera handle.  On macOS the
+    # leaked handle blocks the next process from getting camera
+    # permission until the OS cleans it up -- a show-day failure
+    # mode.  Wrapping the whole setup keeps the camera released on
+    # every exit path, expected or otherwise.
     try:
+        # Open the fullscreen window FIRST so calibration shows at the
+        # same geometry the OS will run at.  Calibrating in a smaller
+        # window then handing off to a bigger fullscreen would shift the
+        # corner targets outside the trained iris-norm range and the
+        # cursor would land off-screen at the extremes.
+        make_fullscreen_window(WINDOW_NAME)
+        # BUG FIX: pump the cv2 event loop briefly so macOS finalises
+        # the fullscreen promotion before we sample the screen rect.
+        # Without this, screen_size can return the DEFAULT_W/H fallback
+        # (1920x1080) during the brief fullscreen animation; the
+        # calibration would then fit an affine matrix that targets
+        # absolute pixel coordinates up to 1920/1080 even when the
+        # real fullscreen is smaller (e.g. 1470x919 on a 13" MBA).
+        # The OS loop's gaze_cursor clamps to actual canvas extents,
+        # so the right/bottom edges of the screen become unreachable
+        # by gaze.  A short imshow + waitKey burst gives macOS time
+        # to publish the real fullscreen geometry to cv2.
+        _wait_for_fullscreen_geometry(WINDOW_NAME)
+        screen_w, screen_h = screen_size(WINDOW_NAME)
+
+        # 5-point calibration.  Only shown when hand input is online
+        # AND we're NOT in pretrained mode (pretrained skips per-user
+        # calibration entirely).  Returns False on ESC / quit / window-
+        # close / fewer than 3 samples; the OS still boots in mouse-
+        # only mode in that case.  The 0.4s sleep gives the camera +
+        # MediaPipe graph time to publish their first reading so the
+        # calibration screen's "face detected" indicator is accurate
+        # from frame 1.
+        if hand_input is not None and pretrained_gaze is None:
+            time.sleep(0.4)
+            _run_eye_calibration(hand_input, screen_w, screen_h)
+        elif hand_input is not None and pretrained_gaze is not None:
+            # Give the camera thread a moment to publish its first
+            # L2CS inference before the OS starts hit-testing against
+            # the gaze cursor.  Without this brief pause the first
+            # ~10 frames render with the mouse as cursor source, which
+            # reads as a hiccup.
+            time.sleep(0.4)
+
+        # Reduced-motion detection.  Combines the argparse-parsed flag
+        # (which is itself parsed against `_CLI_FLAG_REDUCED_MOTION`) with
+        # the legacy sys.argv check and the cv2 R-key poll, so a user who
+        # is still in the habit of typing `--reduced-motion` directly gets
+        # the same effect.  reduced_motion_requested_via_cli is a no-op if
+        # the flag isn't present, so OR-chaining with args.reduced_motion
+        # is safe.
+        reduced_motion = (
+            args.reduced_motion
+            or reduced_motion_requested_via_cli()
+            or reduced_motion_requested_via_keypoll()
+        )
+
+        compositor = Compositor(reduced_motion=reduced_motion)
+        ctx = _MainLoopContext()
+        cv2.setMouseCallback(WINDOW_NAME, _mouse_callback, ctx)
+
+        # Time baseline -- cv2 tick clock, the same one phase5's
+        # now_ms_relative reads.  Compositor expects now_ms relative to
+        # this baseline.
+        t0_ticks = cv2.getTickCount()
+
+        last_t = time.perf_counter() - (1.0 / 60.0)
+        fps_ema = 0.0
+
         while True:
             canvas_w, canvas_h = screen_size(WINDOW_NAME)
             last_t, _dt, fps_ema = _update_fps(last_t, fps_ema)
@@ -1147,7 +1215,7 @@ def main() -> None:
         cv2.destroyAllWindows()
 
 
-def _no_hand_frame():
+def _no_hand_frame() -> Any:
     """Return a synthesised "no hand" HandFrame for the fallback path.
 
     The hand_input is None when bring-up failed; main() still wants

@@ -255,19 +255,28 @@ def render_safari(frame: np.ndarray, w: int, h: int) -> None:
 # warm desert beige, sky blue, dusty rose, mid grey, etc.  Each one sits
 # in the same lightness band so the grid reads as a coherent library
 # rather than a rainbow palette.
+#
+# BUG FIX: 10 of these tuples were previously stored as (R, G, B) in a
+# slot named `_PHOTO_COLORS_BGR` and passed to rounded_rect's color_bgr
+# argument -- a BGR/RGB byte-order mixup.  Result: every "warm beige"
+# rendered as a cool blue-grey and every "dusk blue" rendered as a
+# warm tan, because the channels were transposed before cv2 read them.
+# Each warm/cool labelled tuple below has been reversed to true BGR so
+# the labels match the rendered colour.  The "bleached cloud" and
+# "paper" entries were ambiguous / already correct and are left untouched.
 _PHOTO_COLORS_BGR: Final[list[tuple[int, int, int]]] = [
-    (210, 200, 180),   # warm grey-beige
-    (220, 215, 200),   # bone
-    (180, 165, 150),   # deep beige
-    (200, 180, 165),   # sand
-    (155, 175, 195),   # dusk blue
-    (185, 200, 215),   # pale sky
-    (215, 220, 225),   # bleached cloud
-    (170, 175, 185),   # cool grey
-    (195, 205, 215),   # winter morning
-    (165, 180, 195),   # dawn
-    (140, 155, 170),   # storm
-    (225, 230, 235),   # paper
+    (180, 200, 210),   # warm grey-beige
+    (200, 215, 220),   # bone
+    (150, 165, 180),   # deep beige
+    (165, 180, 200),   # sand
+    (195, 175, 155),   # dusk blue
+    (215, 200, 185),   # pale sky
+    (215, 220, 225),   # bleached cloud  (neutral; unchanged)
+    (185, 175, 170),   # cool grey
+    (215, 205, 195),   # winter morning
+    (195, 180, 165),   # dawn
+    (170, 155, 140),   # storm
+    (225, 230, 235),   # paper           (already BGR-correct; unchanged)
 ]
 
 

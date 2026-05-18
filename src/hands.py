@@ -718,36 +718,62 @@ class HandInput:
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
         self._cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
 
-        # MediaPipe Hands.  static_image_mode=False enables tracking
-        # between frames, which is faster than per-frame detection and
-        # gives smoother landmark trajectories -- important for our
-        # per-frame wrist-displacement test.
-        self._hands_model = self._mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=MAX_HANDS,
-            min_detection_confidence=MIN_DETECT_CONF,
-            min_tracking_confidence=MIN_TRACK_CONF,
-        )
-        # mp_hands.HAND_CONNECTIONS is a list of (a, b) index pairs
-        # describing the skeleton's bones.  Cached here so the
-        # thumbnail painter does not look it up under the lock.
-        self._connections = self._mp.solutions.hands.HAND_CONNECTIONS
+        # BUG FIX: release the camera + any already-built MediaPipe
+        # model if model construction below raises.  Without this
+        # cleanup a mismatched mediapipe wheel (the only realistic way
+        # the Hands or FaceMesh constructor fails after the cap is
+        # open) would leak the camera handle, blocking the next
+        # process from opening the same device on macOS until the
+        # interpreter exits.
+        self._hands_model = None
+        self._face_mesh = None
+        try:
+            # MediaPipe Hands.  static_image_mode=False enables tracking
+            # between frames, which is faster than per-frame detection and
+            # gives smoother landmark trajectories -- important for our
+            # per-frame wrist-displacement test.
+            self._hands_model = self._mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=MAX_HANDS,
+                min_detection_confidence=MIN_DETECT_CONF,
+                min_tracking_confidence=MIN_TRACK_CONF,
+            )
+            # mp_hands.HAND_CONNECTIONS is a list of (a, b) index pairs
+            # describing the skeleton's bones.  Cached here so the
+            # thumbnail painter does not look it up under the lock.
+            self._connections = self._mp.solutions.hands.HAND_CONNECTIONS
 
-        # MediaPipe Face Mesh -- ALSO run on each camera frame so the
-        # gaze (iris-in-eye normalised position) can drive the OS
-        # cursor.  Sharing the same VideoCapture + the same background
-        # thread is the only way that works on macOS, where two
-        # simultaneous VideoCapture instances on the same device fight
-        # over the AVFoundation backing and one of them starves.
-        # refine_landmarks=True is REQUIRED -- without it the iris
-        # landmarks (468..477) don't exist in the output.
-        self._face_mesh = self._mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=FACE_MIN_DETECT_CONF,
-            min_tracking_confidence=FACE_MIN_TRACK_CONF,
-        )
+            # MediaPipe Face Mesh -- ALSO run on each camera frame so the
+            # gaze (iris-in-eye normalised position) can drive the OS
+            # cursor.  Sharing the same VideoCapture + the same background
+            # thread is the only way that works on macOS, where two
+            # simultaneous VideoCapture instances on the same device fight
+            # over the AVFoundation backing and one of them starves.
+            # refine_landmarks=True is REQUIRED -- without it the iris
+            # landmarks (468..477) don't exist in the output.
+            self._face_mesh = self._mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=FACE_MIN_DETECT_CONF,
+                min_tracking_confidence=FACE_MIN_TRACK_CONF,
+            )
+        except Exception as exc:                              # noqa: BLE001
+            # Release everything already acquired before re-raising as
+            # HandInputUnavailable.  The caller's `except
+            # HandInputUnavailable` path expects a clean slate to fall
+            # back to mouse-only mode.
+            if self._hands_model is not None:
+                try:
+                    self._hands_model.close()
+                except Exception:                             # noqa: BLE001
+                    pass
+            if self._cap is not None:
+                self._cap.release()
+                self._cap = None
+            raise HandInputUnavailable(
+                f"MediaPipe model construction failed: {exc}"
+            ) from exc
 
         # Shared state guarded by `self._lock`.  The thread fills
         # these; step() and draw_thumbnail() read them.
@@ -968,9 +994,13 @@ class HandInput:
         noisy smoothed-gaze readings.
 
         Returns True on a successful fit (matrix stored on `self`),
-        False when there aren't enough samples.  The previous
-        matrix is preserved on failure so a partial recalibration
-        doesn't blow away the old model.
+        False when there aren't enough samples OR the captured
+        samples don't span enough of the gaze-norm plane to
+        determine the affine uniquely (rank-deficient design matrix
+        -- e.g. the user kept their eyes still and every sample has
+        the same gaze_norm).  The previous matrix is preserved on
+        failure so a partial recalibration doesn't blow away the
+        old model.
         """
         with self._lock:
             samples = list(self._calibration_samples)
@@ -984,10 +1014,29 @@ class HandInput:
         a_rows = np.array(
             [[gx, gy, 1.0] for (gx, gy), _ in samples], dtype=np.float64,
         )
+        # BUG FIX: reject rank-deficient designs.  np.linalg.lstsq with
+        # rcond=None silently returns a minimum-norm solution on a
+        # rank-deficient input -- which means an affine fit that
+        # collapses the whole gaze-norm plane onto a single screen
+        # point.  After such a "fit", gaze_cursor() would clamp every
+        # reading to roughly the same corner regardless of where the
+        # user looks.  Insisting on full rank 3 (the only rank that
+        # produces a unique solution for a 3-unknown system) makes
+        # fit_calibration fail loudly instead -- and the OS falls
+        # back to the mouse, which is the right behaviour when the
+        # captured samples don't actually describe a varying gaze.
+        if np.linalg.matrix_rank(a_rows) < 3:
+            return False
         y_x = np.array([sx for _, (sx, _sy) in samples], dtype=np.float64)
         y_y = np.array([sy for _, (_sx, sy) in samples], dtype=np.float64)
-        p_x, *_ = np.linalg.lstsq(a_rows, y_x, rcond=None)
-        p_y, *_ = np.linalg.lstsq(a_rows, y_y, rcond=None)
+        try:
+            p_x, *_ = np.linalg.lstsq(a_rows, y_x, rcond=None)
+            p_y, *_ = np.linalg.lstsq(a_rows, y_y, rcond=None)
+        except np.linalg.LinAlgError:
+            # Defensive: numpy can still raise LinAlgError on some
+            # pathological inputs even though we checked rank above.
+            # Treat any solver failure the same as rank deficiency.
+            return False
 
         with self._lock:
             self._calibration_matrix = np.stack([p_x, p_y], axis=0)
@@ -1061,8 +1110,6 @@ class HandInput:
             sy = canvas_h * 0.5 - (
                 pitch_deg + PRETRAINED_PITCH_OFFSET_DEG
             ) * PRETRAINED_PX_PER_DEG_Y
-            cursor_x = int(round(sx))
-            cursor_y = int(round(sy))
         elif current is None:
             # Iris-based paths both need a current smoothed reading.
             return None
@@ -1070,20 +1117,26 @@ class HandInput:
             gx, gy = current
             sx = float(matrix[0, 0] * gx + matrix[0, 1] * gy + matrix[0, 2])
             sy = float(matrix[1, 0] * gx + matrix[1, 1] * gy + matrix[1, 2])
-            cursor_x = int(round(sx))
-            cursor_y = int(round(sy))
         elif baseline is not None:
             dx_norm = current[0] - baseline[0]
             dy_norm = current[1] - baseline[1]
-            cursor_x = int(round(
-                canvas_w * 0.5 + dx_norm * GAZE_GAIN_X * canvas_w,
-            ))
-            cursor_y = int(round(
-                canvas_h * 0.5 + dy_norm * GAZE_GAIN_Y * canvas_h,
-            ))
+            sx = canvas_w * 0.5 + dx_norm * GAZE_GAIN_X * canvas_w
+            sy = canvas_h * 0.5 + dy_norm * GAZE_GAIN_Y * canvas_h
         else:
             return None
 
+        # BUG FIX: guard against NaN/Inf before int(round(...)).  L2CS
+        # forward passes can emit NaN on degenerate frames, and a
+        # rank-deficient (or extreme-input) affine fit can produce
+        # values outside the float-to-int safe range -- in either
+        # case `int(round(nan))` raises ValueError and the OS frame
+        # crash-loops.  Return None on a non-finite reading so the
+        # caller falls back to the mouse for one frame; the next
+        # iteration's reading is usually fine.
+        if not (math.isfinite(sx) and math.isfinite(sy)):
+            return None
+        cursor_x = int(round(sx))
+        cursor_y = int(round(sy))
         cursor_x = max(0, min(canvas_w - 1, cursor_x))
         cursor_y = max(0, min(canvas_h - 1, cursor_y))
         return cursor_x, cursor_y
@@ -1373,27 +1426,42 @@ class HandInput:
         )
         gaze_norm = _compute_gaze_norm(face_list, camera_bgr.shape[1],
                                        camera_bgr.shape[0])
+        # BUG FIX: defer publishing the gaze state until the single
+        # publish-lock acquisition at the end of this method.  An
+        # earlier draft wrote `self._latest_gaze_norm` /
+        # `self._smoothed_gaze_norm` outside the lock; readers
+        # (`latest_gaze_norm`, `gaze_cursor`, `add_calibration_sample`)
+        # all acquire the lock, but the unlocked writer made that lock
+        # meaningless -- and a sufficiently surprising interpreter
+        # change could turn the inconsistency into observable torn
+        # state.  Compute the smoothed value here, but stash it in a
+        # local; the lock block at the bottom of the method publishes
+        # it alongside the HandFrame and the camera buffer.
         if gaze_norm is not None:
             prev = self._smoothed_gaze_norm
             if prev is None:
                 # First reading: seed the EMA with the raw value so
                 # the cursor doesn't ramp from (0,0) for the first
                 # GAZE_SMOOTH_ALPHA-decay window.
-                smoothed = gaze_norm
+                smoothed_to_publish: Optional[tuple[float, float]] = gaze_norm
             else:
-                smoothed = (
+                smoothed_to_publish = (
                     GAZE_SMOOTH_ALPHA * gaze_norm[0]
                     + (1.0 - GAZE_SMOOTH_ALPHA) * prev[0],
                     GAZE_SMOOTH_ALPHA * gaze_norm[1]
                     + (1.0 - GAZE_SMOOTH_ALPHA) * prev[1],
                 )
-            self._latest_gaze_norm = gaze_norm
-            self._smoothed_gaze_norm = smoothed
-        # When no face is detected we KEEP the previous smoothed
-        # reading.  This is the "stale-on-loss" behaviour the user
-        # expects: looking away from the camera for a moment shouldn't
-        # warp the cursor to (0, 0); the cursor just freezes where it
-        # last was until the face comes back.
+            latest_to_publish: Optional[tuple[float, float]] = gaze_norm
+            update_gaze = True
+        else:
+            # When no face is detected we KEEP the previous smoothed
+            # reading.  This is the "stale-on-loss" behaviour the user
+            # expects: looking away from the camera for a moment
+            # shouldn't warp the cursor to (0, 0); the cursor just
+            # freezes where it last was until the face comes back.
+            smoothed_to_publish = None
+            latest_to_publish = None
+            update_gaze = False
 
         # Reset edge flags for this iteration.  The publishable
         # HandFrame's drag_just_* fields are TRUE for exactly the
@@ -1474,6 +1542,14 @@ class HandInput:
             # per process() call, so the OS thread can't observe a
             # half-written list.
             self._latest_face_landmarks = face_list
+            # BUG FIX: publish the gaze state under the same lock as
+            # every other shared field.  See the comment above
+            # update_gaze where these values are computed.  Skip the
+            # write entirely on a no-face frame so the previous
+            # smoothed reading sticks around (stale-on-loss).
+            if update_gaze:
+                self._latest_gaze_norm = latest_to_publish
+                self._smoothed_gaze_norm = smoothed_to_publish
 
     def _advance_tracker(
         self,

@@ -89,7 +89,22 @@ def _ensure_weights() -> Optional[Path]:
         )
         return None
 
-    weights.parent.mkdir(parents=True, exist_ok=True)
+    # BUG FIX: catch mkdir failures (permission denied, read-only
+    # filesystem, parent-doesn't-exist-and-can't-create).  Without
+    # this guard a sandboxed `assets/` directory would crash
+    # PretrainedGaze.try_load() instead of falling back to the
+    # calibrated cursor path -- breaking the "missing dep =
+    # graceful degradation" contract documented in the module
+    # docstring.
+    try:
+        weights.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"[pretrained] Could not create weights directory "
+            f"{weights.parent}: {exc}.  Place L2CSNet_gaze360.pkl "
+            f"manually at the path above to use --pretrained mode."
+        )
+        return None
     print(
         f"[pretrained] Downloading L2CS weights (~88MB) to {weights}...\n"
         f"             If this fails, grab L2CSNet_gaze360.pkl manually "

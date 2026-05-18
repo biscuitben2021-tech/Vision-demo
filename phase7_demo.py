@@ -14,13 +14,21 @@ Interaction model:
                            accidental clicks on a half-formed
                            gesture.
 
-Calibration (automatic at startup):
-    Step 1: 3-second countdown while holding a tight pinch.  Per-
-            frame openness samples are averaged into
-            `calibrated_closed`.
-    Step 2: 3-second countdown while holding a fully open hand.
-            Per-frame samples averaged into `calibrated_open`.
-    Step 3: "Ready." flashes for 1 second; main loop starts.
+Calibration (manual, SPACE-driven, at startup):
+    Step 1: Prompt asks for a tight pinch.  The live camera
+            thumbnail is shown so the user can confirm the hand is
+            visible and tracked.  SPACE captures the current
+            openness sample into `closed_openness` and advances.
+    Step 2: Same pattern for a wide-open hand; SPACE captures into
+            `open_openness`.  A sanity check rejects the sample if
+            `open_openness <= closed_openness + epsilon`.
+    Step 3: "Calibration complete. Press SPACE to begin." -- on
+            SPACE the calibration UI exits and the main loop runs.
+
+    Manual capture was chosen over a timed countdown because the
+    user knows when their hand is correctly posed; a timer either
+    rushes them or wastes seconds, and a noisy frame at the moment
+    the timer hits zero can pollute the calibration.
 
 Thresholds derived from calibration:
     click_threshold     = closed + CLICK_TRIGGER_RATIO * (open - closed)
@@ -55,7 +63,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Final, Optional
+from typing import Callable, Final, Optional
 
 import cv2
 import mediapipe as mp
@@ -105,11 +113,19 @@ CLICK_COOLDOWN_FRAMES: Final[int] = 20
 # clicks.
 RIPPLE_FRAMES: Final[int] = 20
 
-# Calibration timing.  3 seconds is long enough to gather ~90
-# samples at 30fps -- more than the per-frame noise needs to
-# average out -- and short enough not to feel tedious.
-CALIBRATION_SECONDS: Final[float] = 3.0
-READY_SECONDS:       Final[float] = 1.0
+# Minimum gap between open and closed openness for a calibration
+# pair to be considered usable.  Below this we reject and ask for a
+# wider open hand; the FSM math (threshold = closed + ratio*(open -
+# closed)) collapses if the two means are essentially identical, so
+# this guards against the user calibrating two near-identical poses
+# (either a too-loose "pinch" or a too-cramped "open").
+CALIBRATION_MIN_GAP: Final[float] = 0.05
+
+# How many frames a transient calibration hint ("No hand visible",
+# "Open value not high enough") stays on screen after SPACE was
+# pressed in an invalid state.  At ~30fps this is ~2 seconds --
+# long enough to read, short enough not to feel like the UI froze.
+FLASH_FRAMES: Final[int] = 60
 
 # Event log: how many recent events to display in the bottom-left.
 EVENT_LOG_MAX: Final[int] = 6
@@ -146,6 +162,11 @@ WINDOW_NAME: Final[str] = "Hand Demo (phase7)"
 # Quit keys.  ESC + lowercase / uppercase Q so muscle memory from
 # every other phase script keeps working here.
 QUIT_KEYS: Final[tuple[int, ...]] = (27, ord("q"), ord("Q"))
+
+# Advance / confirm key during calibration.  ASCII 32 is the
+# SPACE bar -- the universal "I'm ready, take the sample" gesture
+# from every dual-action UI on the planet.
+KEY_SPACE: Final[int] = 32
 
 
 # ============================================================================
@@ -277,31 +298,48 @@ def _landmark_xyz(lm) -> np.ndarray:
 # Camera open + MediaPipe Hands construction
 # ============================================================================
 
-def open_camera() -> Optional[cv2.VideoCapture]:
-    """Probe indices 0..4 and return the first VideoCapture that delivers a frame.
+def verify_camera_at_startup() -> cv2.VideoCapture:
+    """Pre-flight the camera before any UI shows; exit cleanly on failure.
 
-    macOS exposes multiple cameras when Continuity Camera is on
-    (your iPhone appears alongside the built-in FaceTime camera).
-    Auto-picking the first working device is good enough for a
-    standalone demo -- if the operator gets the wrong camera they
-    can quit, unplug, retry.
+    Opens cv2.VideoCapture(0), confirms both `isOpened()` and a
+    successful read of a real frame, then returns the live handle.
+    On any failure prints the human-readable diagnostics block
+    described in the demo spec (camera-in-use / permission /
+    not-present) and exits with code 1 -- no traceback, no half-
+    shown window.  Returning a working VideoCapture lets the caller
+    skip a second open in `main()`.
 
-    Returns None if no camera responds.  Caller handles the
-    no-camera path (prints a message and exits cleanly).
+    Why a dedicated pre-flight rather than a defensive try/except
+    inside the main loop: the failure modes here (camera taken by
+    another app, permission denied) need a friendly message to
+    stdout, not a stack trace from somewhere mid-calibration.  By
+    the time the user is staring at the prompt, the camera is
+    proven; everything downstream can assume `cap.read()` mostly
+    works.
     """
-    for idx in range(5):
-        cap = cv2.VideoCapture(idx)
-        if not cap.isOpened():
-            cap.release()
-            continue
-        ok, _ = cap.read()
-        if not ok:
-            cap.release()
-            continue
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_W)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
-        return cap
-    return None
+    cap = cv2.VideoCapture(0)
+    ok_open = cap.isOpened()
+    ok_read = False
+    if ok_open:
+        ok_read, frame = cap.read()
+        ok_read = bool(ok_read) and frame is not None
+    if not (ok_open and ok_read):
+        cap.release()
+        cv2.destroyAllWindows()
+        print("Camera unavailable: cv2.VideoCapture(0) could not be opened.")
+        print(
+            "If the camera is in use by another app (Zoom, FaceTime, "
+            "Photo Booth), close it and try again."
+        )
+        print(
+            "If you have not granted camera permission, open System "
+            "Settings -> Privacy & Security -> Camera and enable it "
+            "for your terminal, then re-run."
+        )
+        sys.exit(1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
+    return cap
 
 
 def build_hands_model() -> mp.solutions.hands.Hands:
@@ -315,94 +353,195 @@ def build_hands_model() -> mp.solutions.hands.Hands:
 
 
 # ============================================================================
-# Calibration screens
+# Calibration screens (manual, SPACE-driven)
 # ============================================================================
+#
+# Three screens form the calibration UI: PINCH, OPEN, READY.  Each
+# renders the same chrome -- prompt centred above the midline, a
+# hint line below it (live openness readout / "No hand visible" /
+# transient error flash), and the camera thumbnail in the bottom-
+# right so the user can see what the tracker sees before they hit
+# SPACE.  The user controls the pace: a sample is only taken on a
+# deliberate SPACE press while a hand is in view.
 
-def render_countdown(canvas: np.ndarray, prompt: str, seconds_left: float) -> None:
-    """Paint the prompt + countdown number on a black calibration canvas.
+def render_prompt(canvas: np.ndarray, prompt: str) -> None:
+    """Paint the primary instruction prompt onto a black calibration canvas.
 
-    Two lines: the prompt text sits just above the canvas centre;
-    the BIG countdown number sits below it.  Using cv2.putText
-    (not PIL) intentionally -- this is a diagnostic surface, not
-    OS chrome, so the font fidelity bar is lower and we get to
-    skip the PIL/numpy alpha-composite cost.
+    Centred horizontally, sitting above the midline so the hint
+    line below has room.  Using cv2.putText (not PIL) intentionally
+    -- this is a diagnostic surface, not OS chrome, so the font
+    fidelity bar is lower and we get to skip the PIL/numpy alpha-
+    composite cost.
     """
-    canvas[:] = COLOR_BLACK
     h, w = canvas.shape[:2]
-    # Prompt: medium size, centred above the midline.
-    (pw, ph), _ = cv2.getTextSize(
-        prompt, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2,
-    )
+    (pw, _), _ = cv2.getTextSize(prompt, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
     cv2.putText(
         canvas, prompt, ((w - pw) // 2, h // 2 - 40),
-        cv2.FONT_HERSHEY_SIMPLEX, 1.2, COLOR_WHITE, 2, cv2.LINE_AA,
+        cv2.FONT_HERSHEY_SIMPLEX, 1.0, COLOR_WHITE, 2, cv2.LINE_AA,
     )
-    # Countdown digit: large, centred below the midline.  ceil()
-    # so the user sees "3" for the first 1s, "2" for the next, etc.
-    digit = f"{int(np.ceil(max(0.0, seconds_left)))}"
-    (dw, dh), _ = cv2.getTextSize(
-        digit, cv2.FONT_HERSHEY_SIMPLEX, 5.0, 8,
-    )
+
+
+def render_hint(canvas: np.ndarray, hint: str, color: tuple[int, int, int]) -> None:
+    """Paint the secondary hint line (live readout or transient error flash).
+
+    Smaller than the prompt and rendered in DIM by default, RED
+    when used for an error flash (e.g. "No hand visible") so the
+    user sees the problem immediately.
+    """
+    if not hint:
+        return
+    h, w = canvas.shape[:2]
+    (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
     cv2.putText(
-        canvas, digit, ((w - dw) // 2, h // 2 + dh + 20),
-        cv2.FONT_HERSHEY_SIMPLEX, 5.0, COLOR_WHITE, 8, cv2.LINE_AA,
+        canvas, hint, ((w - hw) // 2, h // 2 + 20),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
     )
+
+
+def _process_camera_frame(
+    cap: cv2.VideoCapture,
+    hands: mp.solutions.hands.Hands,
+) -> tuple[Optional[np.ndarray], object, bool, Optional[float]]:
+    """Read+mirror one camera frame and run MediaPipe.
+
+    Returns (mirrored_bgr_frame, results, has_hand, openness).
+    The frame is None if the read failed; callers should skip
+    rendering the thumbnail when that happens.
+    """
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        return None, None, False, None
+    frame = cv2.flip(frame, 1)
+    results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    has_hand = bool(results.multi_hand_landmarks)
+    openness = (
+        compute_openness(results.multi_hand_landmarks[0].landmark)
+        if has_hand else None
+    )
+    return frame, results, has_hand, openness
+
+
+def _render_calibration_frame(
+    canvas: np.ndarray,
+    prompt: str,
+    hint: str,
+    hint_color: tuple[int, int, int],
+    camera_frame: Optional[np.ndarray],
+    results,
+    has_hand: bool,
+) -> None:
+    """Paint one full calibration frame: black bg + prompt + hint + thumbnail.
+
+    Factored out because all three calibration screens (PINCH,
+    OPEN, READY) share the exact same chrome -- only the prompt
+    and hint change between them.  The thumbnail is always shown
+    when a camera frame is available, so the user can see what the
+    tracker sees during every step (Bug 3 fix).
+    """
+    canvas[:] = COLOR_BLACK
+    render_prompt(canvas, prompt)
+    render_hint(canvas, hint, hint_color)
+    if camera_frame is not None:
+        multi = results.multi_hand_landmarks if results is not None else None
+        draw_camera_thumbnail(canvas, camera_frame, multi, has_hand)
+
+
+def _build_step_hint(
+    has_hand: bool, openness: Optional[float], flash: str,
+) -> tuple[str, tuple[int, int, int]]:
+    """Choose the hint line + colour for one calibration frame.
+
+    Priority: an active flash message (SPACE was pressed in an
+    invalid state) always wins -- it's the most actionable signal
+    the user just produced.  Otherwise: "No hand visible." in RED
+    if the tracker can't see one, or a live openness readout in
+    DIM if it can.  The readout is the user's "is my pose close
+    enough" guide before they commit.
+    """
+    if flash:
+        return flash, COLOR_RED
+    if not has_hand:
+        return "No hand visible. Show your hand to the camera.", COLOR_RED
+    assert openness is not None  # has_hand implies a sample was taken
+    return f"Openness: {openness:.3f}  --  press SPACE to capture.", COLOR_DIM
 
 
 def run_calibration_step(
     cap: cv2.VideoCapture,
     hands: mp.solutions.hands.Hands,
     prompt: str,
+    reject_predicate: Optional[Callable[[float], bool]] = None,
+    reject_message: str = "",
 ) -> Optional[float]:
-    """Run one 3-second openness capture; return the mean, or None on ESC.
+    """Run one manual SPACE-driven openness capture.
 
-    Per-iteration loop: read camera -> mirror -> RGB convert ->
-    Hands inference.  If a hand is detected, append the openness
-    sample.  Render the countdown UI.  Bail on ESC (returns None
-    so the caller can abort the demo).
+    Returns the captured openness when SPACE is pressed while a
+    hand is visible and (optionally) the sample passes the
+    `reject_predicate(sample) -> bool` test.  Returns None if the
+    user quits (ESC/Q) during the step.
+
+    `reject_predicate` is used by the OPEN step to enforce the
+    "open value must clearly exceed closed value" sanity check
+    without leaking that domain logic into this function.
     """
-    samples: list[float] = []
     canvas = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
-    start = time.perf_counter()
+    flash_text: str = ""
+    flash_remaining: int = 0
     while True:
-        elapsed = time.perf_counter() - start
-        remaining = CALIBRATION_SECONDS - elapsed
-        if remaining <= 0:
-            break
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            frame = cv2.flip(frame, 1)
-            results = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            if results.multi_hand_landmarks:
-                samples.append(
-                    compute_openness(results.multi_hand_landmarks[0].landmark),
-                )
-        render_countdown(canvas, prompt, remaining)
+        camera_frame, results, has_hand, openness = _process_camera_frame(
+            cap, hands,
+        )
+        if flash_remaining > 0:
+            flash_remaining -= 1
+        else:
+            flash_text = ""
+        hint, hint_color = _build_step_hint(
+            has_hand, openness, flash_text,
+        )
+        _render_calibration_frame(
+            canvas, prompt, hint, hint_color, camera_frame, results, has_hand,
+        )
         cv2.imshow(WINDOW_NAME, canvas)
-        if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS:
+        key = cv2.waitKey(1) & 0xFF
+        if key in QUIT_KEYS:
             return None
-    if not samples:
-        return None
-    return float(np.mean(samples))
+        if key == KEY_SPACE:
+            if not has_hand or openness is None:
+                flash_text = "No hand visible -- pinch in view, then press SPACE again."
+                flash_remaining = FLASH_FRAMES
+                continue
+            if reject_predicate is not None and reject_predicate(openness):
+                flash_text = reject_message
+                flash_remaining = FLASH_FRAMES
+                continue
+            return openness
 
 
-def run_ready_screen() -> None:
-    """Flash 'Ready.' for READY_SECONDS so the user gets a beat to settle."""
+def run_ready_screen(
+    cap: cv2.VideoCapture,
+    hands: mp.solutions.hands.Hands,
+) -> bool:
+    """Show 'Calibration complete' until SPACE is pressed.
+
+    Returns True if the user pressed SPACE to begin, False if they
+    quit (ESC/Q).  Keeps showing the thumbnail so the user can
+    sanity-check tracking one last time before going live.
+    """
     canvas = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
-    start = time.perf_counter()
-    while time.perf_counter() - start < READY_SECONDS:
-        canvas[:] = COLOR_BLACK
-        h, w = canvas.shape[:2]
-        (tw, th), _ = cv2.getTextSize(
-            "Ready.", cv2.FONT_HERSHEY_SIMPLEX, 4.0, 8,
+    prompt = "Calibration complete. Press SPACE to begin."
+    while True:
+        camera_frame, results, has_hand, _ = _process_camera_frame(
+            cap, hands,
         )
-        cv2.putText(
-            canvas, "Ready.", ((w - tw) // 2, (h + th) // 2),
-            cv2.FONT_HERSHEY_SIMPLEX, 4.0, COLOR_WHITE, 8, cv2.LINE_AA,
+        _render_calibration_frame(
+            canvas, prompt, "", COLOR_DIM, camera_frame, results, has_hand,
         )
         cv2.imshow(WINDOW_NAME, canvas)
-        if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS:
-            return
+        key = cv2.waitKey(1) & 0xFF
+        if key in QUIT_KEYS:
+            return False
+        if key == KEY_SPACE:
+            return True
 
 
 # ============================================================================
@@ -702,42 +841,37 @@ def main_loop(
 # ============================================================================
 
 def main() -> None:
-    """Open camera + tracker, run calibration, hand off to the main loop."""
-    cap = open_camera()
-    if cap is None:
-        print(
-            "[phase7_demo] No camera detected.  On macOS, check System "
-            "Settings -> Privacy & Security -> Camera and confirm "
-            "your terminal has access.",
-            file=sys.stderr,
-        )
-        return
+    """Verify camera, run manual calibration, hand off to the main loop."""
+    # Bug 1 fix: pre-flight the camera *before* any window opens.
+    # On failure, `verify_camera_at_startup` prints diagnostics and
+    # calls sys.exit(1); we never reach the line below.
+    cap = verify_camera_at_startup()
     hands = build_hands_model()
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, CANVAS_W, CANVAS_H)
 
     try:
+        # Step 1 -- PINCH.  No reject predicate: any visible hand
+        # produces a usable closed sample (we sanity-check the
+        # *pair* in step 2 instead).
         closed = run_calibration_step(
-            cap, hands, "Make a tight pinch and hold...",
+            cap, hands,
+            "Pinch your fingers together, then press SPACE to capture.",
         )
         if closed is None:
             return
+        # Step 2 -- OPEN.  Reject if the new sample isn't clearly
+        # wider than the closed one; without this guard the FSM
+        # thresholds collapse and every frame reads as DEAD ZONE.
         open_ = run_calibration_step(
-            cap, hands, "Now open your hand wide and hold...",
+            cap, hands,
+            "Open your hand wide, then press SPACE to capture.",
+            reject_predicate=lambda s: s <= closed + CALIBRATION_MIN_GAP,
+            reject_message=(
+                "Open value not high enough -- try again with a wider open hand."
+            ),
         )
         if open_ is None:
-            return
-        if open_ <= closed:
-            # Sanity check: if the user calibrated the same gesture
-            # twice (or held still wrong), the FSM math degenerates.
-            # Bail with a clear message rather than running with
-            # broken thresholds.
-            print(
-                "[phase7_demo] Calibration failed: open <= closed "
-                f"({open_:.3f} <= {closed:.3f}).  Recalibrate and "
-                "ensure step 2 is a genuinely wide-open hand.",
-                file=sys.stderr,
-            )
             return
         cal = CalibrationData.from_raw(closed, open_)
         print(
@@ -746,7 +880,9 @@ def main() -> None:
             f"{cal.click_threshold:.3f}, dead_zone_threshold="
             f"{cal.dead_zone_threshold:.3f}"
         )
-        run_ready_screen()
+        # Step 3 -- READY.  SPACE to begin; ESC/Q still bails.
+        if not run_ready_screen(cap, hands):
+            return
         main_loop(cap, hands, cal)
     finally:
         # Defensive shutdown: release the camera + close any cv2

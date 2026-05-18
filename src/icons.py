@@ -39,7 +39,7 @@ Module color-space convention:
 from __future__ import annotations
 
 import math
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import cv2
 import numpy as np
@@ -52,6 +52,13 @@ from src.design import (
     load_font,
 )
 from src.tiles import rounded_rect
+
+if TYPE_CHECKING:
+    # Imported only for type-annotation use; PIL is already a runtime
+    # transitive dependency via src.design, so this never adds a real
+    # import cost.  Guarded with TYPE_CHECKING so the module's runtime
+    # imports stay minimal.
+    from PIL import ImageFont
 
 
 # ============================================================================
@@ -115,16 +122,21 @@ from src.tiles import rounded_rect
 # Frost tint -- near-white BGR plane that gets alpha-blended onto the
 # glass surface at 10-12% opacity.  This is the single most important
 # component: without it, the panel looks like "tinted glass over content"
-# rather than "frosted glass with content underneath".  (240, 240, 245)
-# BGR has a hair of blue lift in BGR -- a faint cool cast that
-# distinguishes it from pure paper white.
-_FROST_TINT_BGR: Final[tuple[int, int, int]] = (240, 240, 245)
+# rather than "frosted glass with content underneath".  The faint blue
+# lift comes from B=245 (last channel in this BGR triple is the RED
+# channel; the FIRST is blue).  BUG FIX: the value was previously
+# (240, 240, 245) which is B=240, G=240, R=245 -- that's a hair of RED
+# in BGR, not blue.  Swapped so the high channel sits where cv2 reads
+# blue.
+_FROST_TINT_BGR: Final[tuple[int, int, int]] = (245, 240, 240)
 
 # Rim highlight colour.  Slightly cooler than pure #fff so the rim
 # doesn't read as a "fluorescent strip" against the warm content
 # behind it.  Drawn at 1px with cv2.LINE_AA along the top edge + top
-# corner arcs, then composited at 50% opacity.
-_RIM_COLOR_BGR: Final[tuple[int, int, int]] = (245, 245, 250)
+# corner arcs, then composited at 50% opacity.  BUG FIX: previously
+# (245, 245, 250) BGR which has R=250 -- that's a hair of red, not
+# cool.  Reversed to put the high channel on B.
+_RIM_COLOR_BGR: Final[tuple[int, int, int]] = (250, 245, 245)
 
 # Blur kernel range.  Even values must be incremented to odd because
 # cv2.GaussianBlur requires an odd kernel size.  Intensity 1.0 picks
@@ -211,8 +223,14 @@ _AURORA_CACHE: dict[tuple[int, int], np.ndarray] = {}
 _AURORA_BASELINE_BGR: Final[tuple[int, int, int]] = (12, 10, 14)
 _AURORA_BLOBS: Final[tuple[tuple[float, float, tuple[int, int, int], float], ...]] = (
     # (cx_norm, cy_norm, color_bgr, sigma_norm)  in [0..1] normalized coords
-    (0.22, 0.18, (170, 55, 95),   0.32),   # warm purple,  upper-left
-    (0.78, 0.20, (195, 110, 180), 0.30),   # soft pink,    upper-right
+    # BUG FIX: the first two tuples were previously stored as (170, 55, 95)
+    # and (195, 110, 180) -- those values are RGB order, not BGR, so the
+    # "warm purple" rendered as a cool blue-violet and the "soft pink" as
+    # a cool plum.  Reversed to actual BGR so the rendered aurora matches
+    # the warm-purple-to-cool-blue diagonal the comments describe.  The
+    # third tuple was already correct BGR (B=210 dominant => cool blue).
+    (0.22, 0.18, (95, 55, 170),   0.32),   # warm purple,  upper-left
+    (0.78, 0.20, (180, 110, 195), 0.30),   # soft pink,    upper-right
     (0.55, 0.78, (210, 145, 70),  0.36),   # cool blue,    lower-center
 )
 
@@ -841,7 +859,7 @@ _ICON_TINTS: Final[dict[str, tuple[int, int, int]]] = {
 # call to keep import time fast; cached on the function object so we
 # don't pay the truetype-parse cost every frame.  Pattern mirrors
 # `_get_tile_fonts` in src/tiles.py.
-def _calendar_date_font():
+def _calendar_date_font() -> ImageFont.FreeTypeFont:
     cached = getattr(_calendar_date_font, "_cache", None)
     if cached is None:
         cached = load_font(role="display", size=28)

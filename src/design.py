@@ -245,7 +245,20 @@ def _get_supersampled_font(
     if cached is not None:
         return cached
 
-    big = ImageFont.truetype(font.path, size=font.size * supersample)
+    # BUG FIX: also preserve the TrueType collection face `index`.  When
+    # the SFNS variable font is missing and we fall back to Helvetica
+    # Neue, `load_font` loads from HelveticaNeue.ttc with
+    # `index=_HELVETICA_NEUE_BOLD_INDEX` (2) for "display" role.  Without
+    # forwarding `font.index` here, the supersampled copy defaults to
+    # index 0 (Regular), so display text would render at Regular weight
+    # in the oversized patch and downsample to a too-thin glyph.  PIL's
+    # FreeTypeFont exposes `.index` since 9.x; older versions return 0
+    # via getattr default which matches the truetype default.
+    big = ImageFont.truetype(
+        font.path,
+        size=font.size * supersample,
+        index=getattr(font, "index", 0),
+    )
     # Carry over the variation name if the source font has one.  PIL
     # >= 9.5 exposes `get_variation_by_axes` which we can probe; older
     # versions just fall through to the default weight.

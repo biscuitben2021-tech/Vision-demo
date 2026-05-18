@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Final, Literal, Optional
 
 import cv2
 import numpy as np
@@ -85,9 +85,11 @@ from src.icons import (
 
 
 # Gaze-lock chip styling (see Compositor._paint_gaze_lock_chip).
-# Padding controls how much the chip extends past the locked tile;
-# intensity is forwarded to draw_glass_panel; border alpha is the
-# per-pixel blend factor for the 1px focus ring.
+# Padding controls how much the chip extends past the locked tile on
+# EACH side -- so PAD=12 makes the chip 24px wider/taller overall, with
+# a 12px halo peeking out around the icon.  Intensity is forwarded to
+# draw_glass_panel.  BORDER_ALPHA is the per-pixel blend factor for the
+# 2px focus ring (BORDER_PX); the spec is "2px border at 80% alpha".
 _GAZE_LOCK_PAD:            Final[int]                  = 12
 _GAZE_LOCK_INTENSITY:      Final[float]                = 0.9
 _GAZE_LOCK_BORDER_BGR:     Final[tuple[int, int, int]] = (250, 250, 255)
@@ -646,19 +648,25 @@ class Compositor:
     def _paint_gaze_lock_chip(self, frame: np.ndarray) -> None:
         """Paint the gaze-lock Liquid Glass chip behind the locked tile.
 
-        Chip geometry: 10px bigger than the tile on each side
-        (so the icon's rounded silhouette sits CENTRED inside it),
-        rendered as a Liquid Glass panel at intensity=0.7 (a touch
-        dimmer than the status bar at 1.0 so the chip recedes
-        behind the icon visually).  A 1px near-white border at 60%
-        opacity traces the chip's rounded silhouette as the "focus
-        ring" -- the part the audience picks up first.
+        Chip geometry: _GAZE_LOCK_PAD (12px) bigger than the tile on
+        each side (so the icon's rounded silhouette sits CENTRED inside
+        it, with a 12px halo peeking out), rendered as a Liquid Glass
+        panel at intensity=_GAZE_LOCK_INTENSITY (0.9) -- a touch dimmer
+        than the status bar at 1.0 so the chip recedes behind the icon
+        visually.  A _GAZE_LOCK_BORDER_PX (2px) near-white border at
+        _GAZE_LOCK_BORDER_ALPHA (80%) opacity traces the chip's rounded
+        silhouette as the "focus ring" -- the part the audience picks
+        up first.
 
         No-op when no lock is set, when the geometry hasn't been
         built yet, OR when a page drag / snap is in flight (the lock
         chip would jitter every frame as the gaze re-snapped during
         the swipe; far more readable to suppress it until the page
         settles).
+
+        Off-canvas placements (a tile near the screen edge where the
+        chip's halo would clip out) are tolerated by draw_glass_panel
+        and _draw_rounded_border, both of which clip silently.
         """
         if self._gaze_lock_tile_id is None:
             return
@@ -677,7 +685,10 @@ class Compositor:
         chip_h = th + 2 * pad
         # Chip radius scales proportionally with size so the visual
         # roundness matches the underlying tile.  RADIUS_APP_ICON is
-        # 28 for a 140x140 tile; scaled to 160x160 we want ~32.
+        # 28 for a 140x140 tile; chip is (140 + 2*pad) = 164 wide at
+        # PAD=12, and we want a radius around 34 to keep the same
+        # corner-roundness ratio.  `RADIUS_APP_ICON + pad // 2` gives
+        # 28 + 6 = 34, which holds the ratio to ~3 sig figs.
         chip_r = RADIUS_APP_ICON + pad // 2
 
         draw_glass_panel(
